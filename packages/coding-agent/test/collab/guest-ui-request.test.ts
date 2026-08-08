@@ -829,6 +829,7 @@ describe("guest ask multi-select Next gating (#4375 PRRT_kwDOQxs0bc6OFbDW)", () 
 					question: "Pick several?",
 					options: [{ label: "Option A" }, { label: "Option B" }],
 					multi: true,
+					allowCustom: false,
 				},
 			];
 			const result = controller.showAskDialog(questions);
@@ -838,7 +839,7 @@ describe("guest ask multi-select Next gating (#4375 PRRT_kwDOQxs0bc6OFbDW)", () 
 			const firstLabels = selectLabels(first);
 			expect(firstLabels).not.toContain("Next →");
 			expect(firstLabels).toContain("Option A");
-			expect(firstLabels).toContain("Other (type your own)");
+			expect(firstLabels).not.toContain("Other (type your own)");
 			expect(firstLabels).toContain("Chat about this");
 
 			// Guest toggles Option A — a real answer, not Next/Other/Chat.
@@ -857,6 +858,45 @@ describe("guest ask multi-select Next gating (#4375 PRRT_kwDOQxs0bc6OFbDW)", () 
 			if (settled?.kind === "submit") {
 				expect(settled.results[0]?.selectedOptions).toEqual(["Option A"]);
 			}
+			guest.socket.close();
+		} finally {
+			await host.stop("test done");
+		}
+	});
+
+	it("omits Other for a single-select question when custom answers are disabled", async () => {
+		const ctx = makeAskHostContext();
+		const host = new CollabHost(ctx);
+		await host.start("ws://localhost:8787");
+		ctx.collabHost = host;
+		const controller = new ExtensionUiController(ctx);
+		try {
+			const guest = await joinRawGuest(host.link, COLLAB_PROTO);
+			const welcome = await guest.nextFrame();
+			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
+
+			const result = controller.showAskDialog([
+				{
+					id: "q1",
+					question: "Pick one?",
+					options: [{ label: "Option A" }, { label: "Other (type your own)" }],
+					allowCustom: false,
+				},
+			]);
+			const request = await nextUiRequest(guest);
+			const labels = selectLabels(request);
+			expect(labels).toEqual(["Option A", "Other (type your own)", "Chat about this"]);
+			guest.socket.send({
+				t: "ui-response",
+				reqId: request.request.reqId,
+				value: "Other (type your own)",
+			});
+
+			const settled = await result;
+			expect(settled).toMatchObject({
+				kind: "submit",
+				results: [{ selectedOptions: ["Other (type your own)"], customInput: undefined }],
+			});
 			guest.socket.close();
 		} finally {
 			await host.stop("test done");
