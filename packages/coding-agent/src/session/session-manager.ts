@@ -1278,6 +1278,14 @@ export class SessionManager {
 		return clone;
 	}
 
+	/** Open another journal through the same storage backend and session root. */
+	async openSiblingSession(filePath: string): Promise<SessionManager> {
+		return await SessionManager.open(filePath, this.#sessionDir, this.#storage, {
+			initialCwd: this.#cwd,
+			suppressBreadcrumb: true,
+		});
+	}
+
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
 		this.#closeWriterEventually();
 		this.#diskTail = Promise.resolve();
@@ -1858,6 +1866,11 @@ export class SessionManager {
 
 	getSessionFile(): string | undefined {
 		return this.#sessionFile;
+	}
+
+	/** Whether a session journal exists in this manager's storage backend. */
+	sessionFileExists(sessionFile: string): boolean {
+		return this.#storage.existsSync(sessionFile);
 	}
 
 	getArtifactsDir(): string | null {
