@@ -376,6 +376,16 @@ function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest
 	}
 }
 
+function rpcExtensionUiRequiresResponse(request: RpcExtensionUIRequest): boolean {
+	return (
+		request.method === "ask" ||
+		request.method === "select" ||
+		request.method === "confirm" ||
+		request.method === "input" ||
+		request.method === "editor"
+	);
+}
+
 function isRpcApprovalDecision(value: unknown): value is RpcApprovalDecision {
 	return value === "approve_once" || value === "approve_session" || value === "deny" || value === "cancel";
 }
@@ -509,10 +519,14 @@ export class RpcClient {
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
 	#approvalRequestListeners = new Set<RpcApprovalRequestListener>();
 	#approvalResolvedListeners = new Set<RpcApprovalResolvedListener>();
+	#pendingApprovalRequests = new Map<string, RpcApprovalRequestFrame>();
+	#pendingExtensionUiRequests = new Map<string, RpcExtensionUIRequest>();
+	#pendingExtensionUiTimeouts = new Map<string, NodeJS.Timeout>();
 	#extensionUiResolvedListeners = new Set<RpcExtensionUIResolvedListener>();
 	#planModeChangedListeners = new Set<RpcPlanModeChangedListener>();
 	#planReviewRequestListeners = new Set<RpcPlanReviewRequestListener>();
 	#planReviewResolvedListeners = new Set<RpcPlanReviewResolvedListener>();
+	#pendingPlanReviewRequests = new Map<string, RpcPlanReviewRequestFrame>();
 	#unknownNotificationListeners = new Set<RpcUnknownNotificationListener>();
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
@@ -528,6 +542,30 @@ export class RpcClient {
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
+	}
+
+	#clearPendingExtensionUiRequests(): void {
+		for (const timeout of this.#pendingExtensionUiTimeouts.values()) clearTimeout(timeout);
+		this.#pendingExtensionUiTimeouts.clear();
+		this.#pendingExtensionUiRequests.clear();
+	}
+
+	#forgetPendingExtensionUiRequest(requestId: string): void {
+		this.#pendingExtensionUiRequests.delete(requestId);
+		const timeout = this.#pendingExtensionUiTimeouts.get(requestId);
+		clearTimeout(timeout);
+		this.#pendingExtensionUiTimeouts.delete(requestId);
+	}
+
+	#rememberPendingExtensionUiRequest(request: RpcExtensionUIRequest): void {
+		this.#forgetPendingExtensionUiRequest(request.id);
+		this.#pendingExtensionUiRequests.set(request.id, request);
+		if (!("timeout" in request) || request.timeout === undefined) return;
+		const timeout = this.#startTimeout(request.timeout, () => {
+			this.#pendingExtensionUiRequests.delete(request.id);
+			this.#pendingExtensionUiTimeouts.delete(request.id);
+		});
+		this.#pendingExtensionUiTimeouts.set(request.id, timeout);
 	}
 
 	/**
@@ -551,6 +589,9 @@ export class RpcClient {
 		this.#frameEncoder = new RpcFrameEncoder();
 		this.#offeredCapabilities = {};
 		this.#selectedCapabilities = {};
+		this.#pendingPlanReviewRequests.clear();
+		this.#pendingApprovalRequests.clear();
+		this.#clearPendingExtensionUiRequests();
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -592,6 +633,9 @@ export class RpcClient {
 			this.#pendingRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
+			this.#pendingPlanReviewRequests.clear();
+			this.#pendingApprovalRequests.clear();
+			this.#clearPendingExtensionUiRequests();
 
 			try {
 				child.kill();
@@ -749,6 +793,9 @@ export class RpcClient {
 			pendingCall.controller.abort(error);
 		}
 		this.#pendingHostToolCalls.clear();
+		this.#pendingPlanReviewRequests.clear();
+		this.#pendingApprovalRequests.clear();
+		this.#clearPendingExtensionUiRequests();
 		return this.#waitForExit(child);
 	}
 
@@ -832,12 +879,14 @@ export class RpcClient {
 	/** Subscribe to extension UI requests, including negotiated rich ask requests. */
 	onExtensionUIRequest(listener: RpcExtensionUIRequestListener): () => void {
 		this.#extensionUiListeners.add(listener);
+		for (const request of this.#pendingExtensionUiRequests.values()) listener(request);
 		return () => this.#extensionUiListeners.delete(listener);
 	}
 
 	/** Subscribe to negotiated structured approval requests. */
 	onApprovalRequest(listener: RpcApprovalRequestListener): () => void {
 		this.#approvalRequestListeners.add(listener);
+		for (const request of this.#pendingApprovalRequests.values()) listener(request);
 		return () => this.#approvalRequestListeners.delete(listener);
 	}
 
@@ -862,6 +911,7 @@ export class RpcClient {
 	/** Subscribe to durable native plan reviews. */
 	onPlanReviewRequest(listener: RpcPlanReviewRequestListener): () => void {
 		this.#planReviewRequestListeners.add(listener);
+		for (const request of this.#pendingPlanReviewRequests.values()) listener(request);
 		return () => this.#planReviewRequestListeners.delete(listener);
 	}
 
@@ -879,12 +929,15 @@ export class RpcClient {
 			} catch (error) {
 				if (!(error instanceof RpcFrameTooLargeError)) throw error;
 				this.#writeFrame({ type: "extension_ui_response", id: requestId, cancelled: true });
+				this.#forgetPendingExtensionUiRequest(requestId);
 				throw error;
 			}
+			this.#forgetPendingExtensionUiRequest(requestId);
 			return;
 		}
 		if ("confirmed" in response) {
 			this.#writeFrame({ type: "extension_ui_response", id: requestId, confirmed: response.confirmed });
+			this.#forgetPendingExtensionUiRequest(requestId);
 			return;
 		}
 		this.#writeFrame({
@@ -893,12 +946,14 @@ export class RpcClient {
 			cancelled: true,
 			...(response.timedOut ? { timedOut: true } : {}),
 		});
+		this.#forgetPendingExtensionUiRequest(requestId);
 	}
 
 	/** Send one exact decision for a negotiated structured approval request. */
 	respondToApproval(requestId: string, decision: RpcApprovalDecision): void {
 		this.#requireCapability("structuredApprovals");
 		this.#writeFrame({ type: "approval_response", id: requestId, decision } satisfies RpcApprovalResponseFrame);
+		this.#pendingApprovalRequests.delete(requestId);
 	}
 
 	/** Submit, redirect, cancel, or time out a negotiated rich ask request. */
@@ -910,8 +965,10 @@ export class RpcClient {
 			} catch (error) {
 				if (!(error instanceof RpcFrameTooLargeError)) throw error;
 				this.#writeFrame({ type: "extension_ui_response", id: requestId, cancelled: true });
+				this.#forgetPendingExtensionUiRequest(requestId);
 				throw error;
 			}
+			this.#forgetPendingExtensionUiRequest(requestId);
 			return;
 		}
 		this.#writeFrame({
@@ -920,6 +977,7 @@ export class RpcClient {
 			cancelled: true,
 			...(response.timedOut ? { timedOut: true } : {}),
 		});
+		this.#forgetPendingExtensionUiRequest(requestId);
 	}
 
 	/** Observe additive notification frames unknown to this client version. */
@@ -1533,16 +1591,19 @@ export class RpcClient {
 		}
 
 		if (isRpcApprovalRequestFrame(data)) {
+			this.#pendingApprovalRequests.set(data.id, data);
 			for (const listener of this.#approvalRequestListeners) listener(data);
 			return;
 		}
 
 		if (isRpcApprovalResolvedFrame(data)) {
+			this.#pendingApprovalRequests.delete(data.id);
 			for (const listener of this.#approvalResolvedListeners) listener(data);
 			return;
 		}
 
 		if (isRpcExtensionUIResolvedFrame(data)) {
+			this.#forgetPendingExtensionUiRequest(data.id);
 			for (const listener of this.#extensionUiResolvedListeners) listener(data);
 			return;
 		}
@@ -1553,19 +1614,24 @@ export class RpcClient {
 		}
 
 		if (isRpcPlanReviewRequestFrame(data)) {
+			this.#pendingPlanReviewRequests.set(data.id, data);
 			for (const listener of this.#planReviewRequestListeners) listener(data);
 			return;
 		}
 
 		if (isRpcPlanReviewResolvedFrame(data)) {
+			this.#pendingPlanReviewRequests.delete(data.id);
 			for (const listener of this.#planReviewResolvedListeners) listener(data);
 			return;
 		}
 
 		if (isRpcExtensionUiRequest(data)) {
-			for (const listener of this.#extensionUiListeners) {
-				listener(data);
+			if (data.method === "cancel") {
+				this.#forgetPendingExtensionUiRequest(data.targetId);
+			} else if (rpcExtensionUiRequiresResponse(data)) {
+				this.#rememberPendingExtensionUiRequest(data);
 			}
+			for (const listener of this.#extensionUiListeners) listener(data);
 			return;
 		}
 

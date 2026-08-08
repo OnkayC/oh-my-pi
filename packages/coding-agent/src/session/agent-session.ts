@@ -4631,6 +4631,23 @@ export class AgentSession {
 		await this.#advisors.waitForPendingCardEvents();
 		await this.#waitForPostPromptRecovery();
 	}
+
+	/** Resume a turn whose user-authored message is already present in the persisted transcript. */
+	async resumePersistedTurn(): Promise<void> {
+		if (this.isStreaming) throw new AgentBusyError();
+		this.#beginInFlight();
+		const generation = this.#promptGeneration;
+		try {
+			await this.#recovery.maybeRestoreRetryFallbackPrimary();
+			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
+			this.#resetPromptMaintenanceState();
+			await this.agent.continue();
+			await this.#waitForPostPromptRecovery(generation);
+		} finally {
+			this.#usagePreflightReadyForNextModelCall = false;
+			this.#endInFlight();
+		}
+	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
 	 * caller prints and drains the final primary response.

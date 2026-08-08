@@ -11,20 +11,23 @@ const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
 
 export type RpcProtocolVersion = 1 | 2;
 export interface RpcFrameEncodingOptions {
-	/** Reject instead of emitting a compact fallback when a v2 logical frame exceeds the reassembly ceiling. */
+	/** Reject instead of truncating or emitting a compact fallback for an oversized logical frame. */
 	rejectOversizedLogicalFrame?: boolean;
 }
 
-/** Raised when an outbound v2 logical frame cannot be represented within the negotiated reassembly ceiling. */
+/** Raised when an outbound logical frame cannot be represented losslessly by the negotiated transport. */
 export class RpcFrameTooLargeError extends Error {
 	constructor(
 		frame: object,
 		readonly byteLength: number,
+		readonly limit = MAX_RPC_REASSEMBLED_BYTES,
 	) {
 		const frameType = isRecord(frame) && typeof frame.type === "string" ? frame.type : "unknown";
-		super(
-			`RPC ${frameType} frame is ${byteLength} bytes and exceeds the protocol v2 reassembly limit of ${MAX_RPC_REASSEMBLED_BYTES} bytes`,
-		);
+		const limitDescription =
+			limit === MAX_RPC_REASSEMBLED_BYTES
+				? `protocol v2 reassembly limit of ${limit} bytes`
+				: `transport limit of ${limit} bytes`;
+		super(`RPC ${frameType} frame is ${byteLength} bytes and exceeds the ${limitDescription}`);
 		this.name = "RpcFrameTooLargeError";
 	}
 }
@@ -294,6 +297,13 @@ export class RpcFrameEncoder {
 		const json = JSON.stringify(frame);
 		let frames: Iterable<string>;
 		let singleFrame: string | undefined;
+		if (
+			options.rejectOversizedLogicalFrame &&
+			this.#protocolVersion === 1 &&
+			serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES
+		) {
+			throw new RpcFrameTooLargeError(frame, serializedFrameBytes(json), MAX_RPC_FRAME_BYTES);
+		}
 		if (this.#protocolVersion === 2 && serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES) {
 			const compacted = compactTerminalFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
 			// Reuse the original serialization when compaction was a no-op.
@@ -301,7 +311,9 @@ export class RpcFrameEncoder {
 			if (serializedFrameBytes(compactedJson) > MAX_RPC_FRAME_BYTES) {
 				const byteLength = Buffer.byteLength(compactedJson, "utf8");
 				if (byteLength > MAX_RPC_REASSEMBLED_BYTES) {
-					if (options.rejectOversizedLogicalFrame) throw new RpcFrameTooLargeError(compacted, byteLength);
+					if (options.rejectOversizedLogicalFrame) {
+						throw new RpcFrameTooLargeError(compacted, byteLength, MAX_RPC_REASSEMBLED_BYTES);
+					}
 					frames = [`${JSON.stringify(overflowFrame(compacted))}\n`];
 				} else {
 					frames = encodeChunkedRpcFrames(compactedJson, `rpc-${++this.#chunkCounter}`, byteLength);
