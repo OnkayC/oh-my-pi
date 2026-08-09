@@ -151,6 +151,12 @@ jobs:
          - uses: actions/checkout@v4
          - uses: bazelbuild/setup-bazelisk@v3
            if: github.repository_owner == 'OnkayC'
+         - name: Expose Bazelisk command
+           if: github.repository_owner == 'OnkayC'
+           run: |
+              mkdir -p "$RUNNER_TEMP/bin"
+              ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
+              echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
          - uses: ./.github/actions/bun-install
          - id: cache
            uses: ./.github/actions/bazel-cache
@@ -199,6 +205,12 @@ jobs:
          - uses: actions/checkout@v4
          - uses: bazelbuild/setup-bazelisk@v3
            if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+         - name: Expose Bazelisk command
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+           run: |
+              mkdir -p "$RUNNER_TEMP/bin"
+              ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
+              echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
          # ---- PR path: latest release addons from npm ----
          - name: Fetch release native addons (npm)
