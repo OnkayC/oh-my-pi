@@ -149,10 +149,8 @@ jobs:
       runs-on: ${{ github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata' }}
       steps:
          - uses: actions/checkout@v4
-         - uses: bazel-contrib/setup-bazel@0.19.0
+         - uses: bazelbuild/setup-bazelisk@v3
            if: github.repository_owner == 'OnkayC'
-           with:
-              bazelisk-version: 1.x
          - uses: ./.github/actions/bun-install
          - id: cache
            uses: ./.github/actions/bazel-cache
@@ -199,10 +197,8 @@ jobs:
       runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || (github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata') }}
       steps:
          - uses: actions/checkout@v4
-         - uses: bazel-contrib/setup-bazel@0.19.0
+         - uses: bazelbuild/setup-bazelisk@v3
            if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
-           with:
-              bazelisk-version: 1.x
 
          # ---- PR path: latest release addons from npm ----
          - name: Fetch release native addons (npm)
