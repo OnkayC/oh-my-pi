@@ -8,7 +8,11 @@
  */
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
-import type { ExtensionError, ExtensionUIContext } from "../extensibility/extensions/types";
+import type {
+	ExtensionCommandContextActions,
+	ExtensionError,
+	ExtensionUIContext,
+} from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 
@@ -28,6 +32,8 @@ export interface InitializeExtensionsOptions {
 	markAgentInvokingMessage?: () => void;
 	/** Optional lifecycle hook for extension-originated sends whose success/failure determines turn ownership. */
 	trackAgentInvokingMessage?: (task: Promise<unknown>) => void;
+	/** Optional mode-owned session actions for centralized transition reconciliation. */
+	sessionActions?: Pick<ExtensionCommandContextActions, "newSession" | "branch" | "switchSession">;
 }
 
 /**
@@ -47,6 +53,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		uiContext,
 		markAgentInvokingMessage,
 		trackAgentInvokingMessage,
+		sessionActions,
 	} = options;
 	const shutdown = onShutdown ?? (() => {});
 
@@ -112,25 +119,31 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		{
 			getContextUsage: () => session.getContextUsage(),
 			waitForIdle: () => session.agent.waitForIdle(),
-			newSession: async newOptions => {
-				const success = await session.newSession({ parentSession: newOptions?.parentSession });
-				if (success && newOptions?.setup) {
-					await newOptions.setup(session.sessionManager);
-				}
-				return { cancelled: !success };
-			},
-			branch: async entryId => {
-				const result = await session.branch(entryId);
-				return { cancelled: result.cancelled };
-			},
+			newSession:
+				sessionActions?.newSession ??
+				(async newOptions => {
+					const success = await session.newSession({ parentSession: newOptions?.parentSession });
+					if (success && newOptions?.setup) {
+						await newOptions.setup(session.sessionManager);
+					}
+					return { cancelled: !success };
+				}),
+			branch:
+				sessionActions?.branch ??
+				(async entryId => {
+					const result = await session.branch(entryId);
+					return { cancelled: result.cancelled };
+				}),
 			navigateTree: async (targetId, navOptions) => {
 				const result = await session.navigateTree(targetId, { summarize: navOptions?.summarize });
 				return { cancelled: result.cancelled };
 			},
-			switchSession: async sessionPath => {
-				const success = await session.switchSession(sessionPath);
-				return { cancelled: !success };
-			},
+			switchSession:
+				sessionActions?.switchSession ??
+				(async sessionPath => {
+					const success = await session.switchSession(sessionPath);
+					return { cancelled: !success };
+				}),
 			reload: async () => {
 				await session.reload();
 			},

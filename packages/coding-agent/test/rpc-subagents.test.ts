@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
 import {
+	handleRpcRollbackTurns,
 	handleRpcSessionChange,
 	type RpcSessionChangeCommand,
 	type RpcSessionChangeResult,
@@ -12,6 +13,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-mode";
 import { RpcSubagentRegistry, readRpcSubagentTranscript } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-subagents";
 import type { RpcSubagentFrame } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
+import { PlanModeController } from "@oh-my-pi/pi-coding-agent/plan-mode/controller";
 import {
 	type AgentProgress,
 	type SubagentEventPayload,
@@ -23,6 +25,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { createTestSession } from "./utilities";
 
 const tempPaths: string[] = [];
 
@@ -219,11 +222,22 @@ describe("RPC subagent registry", () => {
 
 		for (const testCase of cases) {
 			const registry = createRegistryWithSnapshot();
+			const planTransitions: string[] = [];
 			try {
-				const result = await handleRpcSessionChange(testCase.session, testCase.command, registry);
+				const result = await handleRpcSessionChange(testCase.session, testCase.command, () => registry.clear(), {
+					prepareSessionTransition: () => {
+						planTransitions.push("prepare");
+						return Promise.resolve({ status: "off", reentry: false });
+					},
+					reconcileSessionTransition: () => {
+						planTransitions.push("reconcile");
+						return Promise.resolve({ status: "off", reentry: false });
+					},
+				});
 
 				expect(result).toEqual(testCase.expected);
 				expect(registry.getSubagents()).toHaveLength(0);
+				expect(planTransitions).toEqual(["prepare", "reconcile"]);
 				expect(() => registry.resolveSessionFile({ subagentId: "SubagentA" })).toThrow(
 					/Unknown subagent or session file unavailable/,
 				);
@@ -258,15 +272,230 @@ describe("RPC subagent registry", () => {
 
 		for (const testCase of cases) {
 			const registry = createRegistryWithSnapshot();
+			const planTransitions: string[] = [];
 			try {
-				const result = await handleRpcSessionChange(testCase.session, testCase.command, registry);
+				const result = await handleRpcSessionChange(testCase.session, testCase.command, () => registry.clear(), {
+					prepareSessionTransition: () => {
+						planTransitions.push("prepare");
+						return Promise.resolve({ status: "off", reentry: false });
+					},
+					reconcileSessionTransition: () => {
+						planTransitions.push("reconcile");
+						return Promise.resolve({ status: "off", reentry: false });
+					},
+				});
 
 				expect(result).toEqual(testCase.expected);
 				expect(registry.getSubagents()).toMatchObject([{ id: "SubagentA" }]);
+				expect(planTransitions).toEqual(["prepare", "reconcile"]);
 				expect(registry.resolveSessionFile({ subagentId: "SubagentA" })).toBe("/tmp/subagent.jsonl");
 			} finally {
 				registry.dispose();
 			}
+		}
+	});
+
+	test("clears subagent registry after cross-lineage rollback activates parent session", async () => {
+		const registry = createRegistryWithSnapshot();
+		const commits: string[] = [];
+		try {
+			const rollback = await handleRpcRollbackTurns(
+				{
+					sessionId: "child-session",
+					sessionFile: "/tmp/child.jsonl",
+					validateHostTurnRollback: async () => {},
+					rollbackHostTurns: async () => ({
+						removedClientTurnIds: ["turn-child"],
+						remainingTurns: [],
+						sessionId: "parent-session",
+						sessionFile: "/tmp/parent.jsonl",
+					}),
+				},
+				{ count: 1, expectedClientTurnIds: ["turn-child"] },
+				() => {
+					commits.push("committed");
+					registry.clear();
+				},
+			);
+
+			expect(rollback).toMatchObject({
+				sessionId: "parent-session",
+				sessionFile: "/tmp/parent.jsonl",
+				removedClientTurnIds: ["turn-child"],
+			});
+			expect(commits).toEqual(["committed"]);
+			expect(registry.getSubagents()).toHaveLength(0);
+
+			// Same-session rollback must not clear child subagent state.
+			const sameSessionRegistry = createRegistryWithSnapshot();
+			try {
+				const sameSessionCommits: string[] = [];
+				await handleRpcRollbackTurns(
+					{
+						sessionId: "same-session",
+						sessionFile: "/tmp/same.jsonl",
+						validateHostTurnRollback: async () => {},
+						rollbackHostTurns: async () => ({
+							removedClientTurnIds: ["turn-1"],
+							remainingTurns: [],
+							sessionId: "same-session",
+							sessionFile: "/tmp/same.jsonl",
+						}),
+					},
+					{ count: 1, expectedClientTurnIds: ["turn-1"] },
+					() => {
+						sameSessionCommits.push("committed");
+						sameSessionRegistry.clear();
+					},
+				);
+				expect(sameSessionCommits).toEqual([]);
+				expect(sameSessionRegistry.getSubagents()).toMatchObject([{ id: "SubagentA" }]);
+			} finally {
+				sameSessionRegistry.dispose();
+			}
+		} finally {
+			registry.dispose();
+		}
+	});
+
+	test("suspends plan runtime before cross-session rollback and reconciles after", async () => {
+		const planTransitions: string[] = [];
+		const events: string[] = [];
+		const rollback = await handleRpcRollbackTurns(
+			{
+				sessionId: "child-session",
+				sessionFile: "/tmp/child.jsonl",
+				validateHostTurnRollback: async () => {
+					events.push("validate");
+				},
+				rollbackHostTurns: async () => {
+					events.push("rollback");
+					return {
+						removedClientTurnIds: ["turn-child"],
+						remainingTurns: [],
+						sessionId: "parent-session",
+						sessionFile: "/tmp/parent.jsonl",
+					};
+				},
+			},
+			{ count: 1, expectedClientTurnIds: ["turn-child"] },
+			() => {
+				events.push("committed");
+			},
+			{
+				prepareSessionTransition: () => {
+					planTransitions.push("prepare");
+					events.push("prepare");
+					return Promise.resolve({ status: "off", reentry: false });
+				},
+				reconcileSessionTransition: () => {
+					planTransitions.push("reconcile");
+					events.push("reconcile");
+					return Promise.resolve({ status: "off", reentry: false });
+				},
+			},
+		);
+
+		expect(rollback.sessionId).toBe("parent-session");
+		expect(planTransitions).toEqual(["prepare", "reconcile"]);
+		expect(events).toEqual(["validate", "prepare", "rollback", "committed", "reconcile"]);
+	});
+
+	test("does not suspend plan runtime when rollback validation fails", async () => {
+		const planTransitions: string[] = [];
+		await expect(
+			handleRpcRollbackTurns(
+				{
+					sessionId: "busy-session",
+					sessionFile: "/tmp/busy.jsonl",
+					validateHostTurnRollback: async () => {
+						throw new Error("Agent is busy");
+					},
+					rollbackHostTurns: async () => {
+						throw new Error("rollback must not run after validation failure");
+					},
+				},
+				{ count: 1, expectedClientTurnIds: ["turn-1"] },
+				() => {
+					throw new Error("commit must not run after validation failure");
+				},
+				{
+					prepareSessionTransition: () => {
+						planTransitions.push("prepare");
+						return Promise.resolve({ status: "off", reentry: false });
+					},
+					reconcileSessionTransition: () => {
+						planTransitions.push("reconcile");
+						return Promise.resolve({ status: "off", reentry: false });
+					},
+				},
+			),
+		).rejects.toThrow("Agent is busy");
+		expect(planTransitions).toEqual([]);
+	});
+
+	test("clears source-session subagents when fresh plan execution commits the child session", async () => {
+		const ctx = await createTestSession({ inMemory: true });
+		const eventBus = new EventBus();
+		const frames: RpcSubagentFrame[] = [];
+		const registry = new RpcSubagentRegistry(eventBus, frame => frames.push(frame));
+		registry.setSubscriptionLevel("events");
+		eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id: "SubagentA",
+			index: 0,
+			agent: "task",
+			agentSource: "bundled",
+			status: "started",
+			sessionFile: "/tmp/source-subagent.jsonl",
+		} satisfies SubagentLifecyclePayload);
+		const plans = new Map([["local://PLAN.md", "# Plan\n\nDo it."]]);
+		const newSession = vi.spyOn(ctx.session, "newSession").mockImplementation(async () => {
+			expect(registry.getSubagents()).toHaveLength(1);
+			return true;
+		});
+		const controller = new PlanModeController({
+			session: ctx.session,
+			artifacts: {
+				read: path => Promise.resolve(plans.get(path) ?? null),
+				write: (path, markdown) => void plans.set(path, markdown),
+				list: () => Promise.resolve([...plans.keys()]),
+			},
+			dispatchTurn: () => Promise.resolve(true),
+			onSessionTransitionCommitted: () => registry.clear(),
+		});
+		try {
+			await controller.setMode({ status: "active", planFilePath: "local://PLAN.md" });
+			const request = await controller.createReview({ title: "Plan" });
+			await controller.respondToReview({
+				requestId: request.id,
+				decision: { action: "execute", context: "fresh", clientTurnId: "turn-fresh-subagents" },
+			});
+
+			expect(newSession).toHaveBeenCalledTimes(1);
+			expect(registry.getSubagents()).toHaveLength(0);
+			expect(() => registry.resolveSessionFile({ subagentId: "SubagentA" })).toThrow(
+				/Unknown subagent or session file unavailable/,
+			);
+
+			const frameCountAfterSwitch = frames.length;
+			eventBus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
+				index: 0,
+				agent: "task",
+				agentSource: "bundled",
+				task: "Do work",
+				assignment: "Implement work",
+				sessionFile: "/tmp/source-subagent.jsonl",
+				progress: createProgress(),
+			} satisfies SubagentProgressPayload);
+			eventBus.emit(TASK_SUBAGENT_EVENT_CHANNEL, {
+				id: "SubagentA",
+				event: { type: "agent_start" },
+			} satisfies SubagentEventPayload);
+			expect(registry.getSubagents()).toHaveLength(0);
+			expect(frames).toHaveLength(frameCountAfterSwitch);
+		} finally {
+			registry.dispose();
+			await ctx.cleanup();
 		}
 	});
 
@@ -414,6 +643,9 @@ function handle(frame) {
 	if (frame.type === "prompt") {
 		write({ id: frame.id, type: "response", command: "prompt", success: true });
 		write({ type: "notice", level: "info", message: "subagent test" });
+		write({ type: "follow_up_queued", clientTurnId: "turn-queued", optionFingerprint: "options-queued", queuePosition: 1 });
+		write({ type: "host_turn_promoted", clientTurnId: "turn-promoted", optionFingerprint: "options-promoted", model: "anthropic/claude" });
+		write({ type: "host_turn_cancelled", clientTurnId: "turn-cancelled", outcome: "cancelled", reason: "host request" });
 		write({ type: "subagent_lifecycle", payload: { id: "SubagentA", index: 0, agent: "task", agentSource: "bundled", status: "started", sessionFile: "/tmp/subagent.jsonl" } });
 		write({ type: "subagent_progress", payload: { index: 0, agent: "task", agentSource: "bundled", task: "Do work", assignment: "Implement work", sessionFile: "/tmp/subagent.jsonl", progress } });
 		write({ type: "subagent_event", payload: { id: "SubagentA", event: { type: "agent_start" } } });
@@ -428,10 +660,12 @@ function handle(frame) {
 		const progressTasks: string[] = [];
 		const rawEventTypes: string[] = [];
 		const sessionEventTypes: string[] = [];
+		const unknownNotificationTypes: string[] = [];
 		client.onSubagentLifecycle(payload => lifecycleIds.push(payload.id));
 		client.onSubagentProgress(payload => progressTasks.push(payload.task));
 		client.onSubagentEvent(payload => rawEventTypes.push(payload.event.type));
 		client.onSessionEvent(event => sessionEventTypes.push(event.type));
+		client.onUnknownNotification(frame => unknownNotificationTypes.push(String(frame.type)));
 
 		await client.start();
 		await expect(client.setSubagentSubscription("events")).resolves.toBe("events");
@@ -444,6 +678,9 @@ function handle(frame) {
 		expect(lifecycleIds).toEqual(["SubagentA"]);
 		expect(progressTasks).toEqual(["Do work"]);
 		expect(rawEventTypes).toEqual(["agent_start"]);
-		expect(sessionEventTypes).toContain("notice");
+		expect(sessionEventTypes).toEqual(
+			expect.arrayContaining(["notice", "follow_up_queued", "host_turn_promoted", "host_turn_cancelled"]),
+		);
+		expect(unknownNotificationTypes).toEqual([]);
 	});
 });

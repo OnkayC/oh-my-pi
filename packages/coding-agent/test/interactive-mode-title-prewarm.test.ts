@@ -11,6 +11,12 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { tinyTitleClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+const flushImmediate = (): Promise<void> => {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+};
+
 // Issue #6462: the first submit used to spawn the local tiny-title worker
 // synchronously ahead of the first frame, and title generation started before
 // the optimistic user row painted. Startup now prewarms an idle worker, and the
@@ -87,6 +93,7 @@ describe("InteractiveMode tiny-title prewarm", () => {
 		const prewarm = vi.spyOn(tinyTitleClient, "prewarm").mockImplementation(() => {});
 
 		await mode.init();
+		await flushImmediate();
 
 		expect(prewarm).toHaveBeenCalledWith("lfm2-350m");
 	});

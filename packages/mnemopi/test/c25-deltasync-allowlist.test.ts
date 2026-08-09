@@ -1,9 +1,15 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Mnemopi } from "@oh-my-pi/pi-mnemopi/core/memory";
 import { ALLOWED_DELTA_TABLES, DeltaSync, SyncCheckpoint } from "@oh-my-pi/pi-mnemopi/core/streaming";
+
+// Disable on-demand embeddings; otherwise remember() can hang past the 5s
+// default timeout under bun --parallel=8 on loaded CI runners.
+beforeEach(() => {
+	process.env.MNEMOPI_NO_EMBEDDINGS = "1";
+});
 
 const roots: string[] = [];
 
@@ -27,6 +33,7 @@ afterEach(() => {
 		if (root === undefined) break;
 		rmSync(root, { recursive: true, force: true });
 	}
+	delete process.env.MNEMOPI_NO_EMBEDDINGS;
 });
 
 describe("C25 DeltaSync table allowlist", () => {
@@ -35,6 +42,7 @@ describe("C25 DeltaSync table allowlist", () => {
 		expect([...ALLOWED_DELTA_TABLES].sort()).toEqual(["episodic_memory", "working_memory"]);
 	});
 
+	// Seed + multi-path allowlist checks can starve past 5s under bun --parallel=8.
 	it("accepts allowed tables and rejects unknown, injected, and non-string table values", () => {
 		const { memory, root } = seededMemory();
 		try {
@@ -63,7 +71,7 @@ describe("C25 DeltaSync table allowlist", () => {
 		} finally {
 			memory.close();
 		}
-	});
+	}, 30_000);
 
 	it("rejects string-object allowlist bypasses", () => {
 		const { memory, root } = seededMemory();
