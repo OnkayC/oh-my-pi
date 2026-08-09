@@ -157,6 +157,11 @@ jobs:
               mkdir -p "$RUNNER_TEMP/bin"
               ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
               echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+         - name: Install native build tools
+           if: github.repository_owner == 'OnkayC'
+           run: |
+              sudo apt-get update
+              sudo apt-get install --yes cmake ninja-build
          - uses: ./.github/actions/bun-install
          - id: cache
            uses: ./.github/actions/bazel-cache
@@ -211,6 +216,11 @@ jobs:
               mkdir -p "$RUNNER_TEMP/bin"
               ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
               echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+         - name: Install native build tools
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+           run: |
+              sudo apt-get update
+              sudo apt-get install --yes cmake ninja-build
 
          # ---- PR path: latest release addons from npm ----
          - name: Fetch release native addons (npm)
