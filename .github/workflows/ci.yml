@@ -157,11 +157,18 @@ jobs:
               mkdir -p "$RUNNER_TEMP/bin"
               ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
               echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-         - name: Install native build tools
+         - uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3
+           if: github.repository_owner == 'OnkayC'
+           with:
+              cmake-version: 3.31.x
+         - uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
+           if: github.repository_owner == 'OnkayC'
+         - name: Expose native build tools
            if: github.repository_owner == 'OnkayC'
            run: |
-              sudo apt-get update
-              sudo apt-get install --yes cmake ninja-build
+              mkdir -p "$HOME/.local/bin"
+              ln -sf "$(command -v cmake)" "$HOME/.local/bin/cmake"
+              ln -sf "$(command -v ninja)" "$HOME/.local/bin/ninja"
          - uses: ./.github/actions/bun-install
          - id: cache
            uses: ./.github/actions/bazel-cache
@@ -216,11 +223,18 @@ jobs:
               mkdir -p "$RUNNER_TEMP/bin"
               ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
               echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-         - name: Install native build tools
+         - uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+           with:
+              cmake-version: 3.31.x
+         - uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+         - name: Expose native build tools
            if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
            run: |
-              sudo apt-get update
-              sudo apt-get install --yes cmake ninja-build
+              mkdir -p "$HOME/.local/bin"
+              ln -sf "$(command -v cmake)" "$HOME/.local/bin/cmake"
+              ln -sf "$(command -v ninja)" "$HOME/.local/bin/ninja"
 
          # ---- PR path: latest release addons from npm ----
          - name: Fetch release native addons (npm)
