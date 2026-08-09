@@ -175,7 +175,7 @@ describe("EventController displaces consecutive waiting polls", () => {
 			toolOutputExpanded: false,
 			pendingTools,
 			chatContainer,
-			session: { getToolByName: () => undefined },
+			session: { getToolByName: () => undefined, hasBuiltInTool: () => true },
 			showWarning: vi.fn(),
 			viewSession: { getToolByName: () => undefined, hasBuiltInTool: () => true },
 			sessionManager: { getCwd: () => process.cwd() },
