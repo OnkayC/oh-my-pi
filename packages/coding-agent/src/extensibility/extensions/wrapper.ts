@@ -297,7 +297,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				uiContext?.hasToolApprovalGrant?.(sessionId, this.tool.name) === true);
 
 		if (approvalCheck.required && !sessionGrantApplies) {
-			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
+			const scheduledCall = context?.toolCall ? context.toolCall.toolCalls[context.toolCall.index] : undefined;
 			if (scheduledCall?.id === toolCallId && scheduledCall.name === this.tool.name) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 			}
