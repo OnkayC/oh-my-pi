@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import os
 import shutil
@@ -11,17 +12,26 @@ import textwrap
 import threading
 import time
 import unittest
+from unittest import mock
 
 from omp_rpc import (
     AgentEndEvent,
+    ApprovalRequest,
+    ApprovalRequestListener,
+    ApprovalResolved,
+    AskDialogChatResult,
+    AskResolved,
+    ExtensionUiRequest,
+    ImageContent,
     RpcClient,
     RpcCommandError,
     RpcConcurrencyError,
     RpcError,
+    RpcFrameTooLargeError,
     host_tool,
+    host_uri,
 )
 from omp_rpc.client import _RpcFrameDecoder
-
 
 FAKE_SERVER = textwrap.dedent(
     """
@@ -62,6 +72,8 @@ FAKE_SERVER = textwrap.dedent(
             },
             "contextWindow": 200000,
             "maxTokens": 8192,
+            "thinkingEfforts": ["low", "high"],
+            "fastModeSupported": True,
         }
 
     def assistant_message(text: str):
@@ -83,6 +95,7 @@ FAKE_SERVER = textwrap.dedent(
     def current_state():
         return {
             "model": model_info(model_id, model_provider),
+            "approvalMode": approval_mode,
             "thinkingLevel": thinking_level,
             "isStreaming": False,
             "isCompacting": False,
@@ -245,13 +258,29 @@ FAKE_SERVER = textwrap.dedent(
             payload["error"] = error
         print(json.dumps(payload), flush=True)
 
-    print(json.dumps({"type": "ready"}), flush=True)
+    offered_capabilities = {
+        "structuredApprovals": 2,
+        "richUserInput": 1,
+        "planControl": 1,
+        "planReview": 1,
+        "hostTurns": 1,
+        "runtimePolicy": 1,
+        "authStatus": 1,
+        "modelCatalog": 1,
+        "slashCommands": 1,
+        "skills": 1,
+        "tasks": 1,
+        "subagents": 1,
+    }
+    print(json.dumps({"type": "ready", "capabilities": offered_capabilities}), flush=True)
     todo_phases = []
     messages = []
     branch_messages = [{"entryId": "entry-1", "text": "branch message"}]
     model_provider = "anthropic"
     model_id = "claude-sonnet-4-5"
     thinking_level = "medium"
+    approval_mode = "yolo"
+    selected_capabilities = {}
     steering_mode = "one-at-a-time"
     follow_up_mode = "one-at-a-time"
     interrupt_mode = "immediate"
@@ -269,11 +298,68 @@ FAKE_SERVER = textwrap.dedent(
         command_type = command["type"]
         request_id = command.get("id")
 
+        if command_type == "approval_response":
+            decision = command["decision"]
+            if command["id"] == "approval-deny":
+                emit_prompt_turn(f"approval {decision}")
+            elif command["id"] == "approval-cancel":
+                emit_prompt_turn(f"approval {decision}")
+            elif command["id"] == "approval-approve-only":
+                # Headless fail-closed must cancel, never mirror approve_once.
+                emit_prompt_turn(f"approval {decision}")
+            continue
+        if command_type == "extension_ui_response" and "result" in command:
+            continue
+
         if command_type == "extension_ui_response":
             emit_prompt_turn("ui acknowledged")
             continue
 
-        if command_type == "get_state":
+        if command_type == "negotiate_capabilities":
+            selected_capabilities = {
+                key: min(revision, offered_capabilities[key])
+                for key, revision in command.get("capabilities", {}).items()
+                if key in offered_capabilities and isinstance(revision, int) and revision > 0
+            }
+            respond(request_id, "negotiate_capabilities", {"capabilities": selected_capabilities})
+        elif command_type == "set_runtime_policy":
+            approval_mode = command["approvalMode"]
+            respond(request_id, "set_runtime_policy", {"approvalMode": approval_mode})
+        elif command_type == "get_auth_status":
+            respond(
+                request_id,
+                "get_auth_status",
+                {
+                    "providers": [
+                        {
+                            "provider": "anthropic",
+                            "status": "authenticated",
+                            "accounts": [
+                                {
+                                    "type": "oauth",
+                                    "status": "authenticated",
+                                    "email": "dev@example.com",
+                                }
+                            ],
+                        }
+                    ]
+                },
+            )
+        elif command_type == "get_available_skills":
+            respond(
+                request_id,
+                "get_available_skills",
+                {
+                    "skills": [
+                        {
+                            "name": "reviewer",
+                            "description": "Review code",
+                            "source": "project",
+                        }
+                    ]
+                },
+            )
+        elif command_type == "get_state":
             respond(request_id, "get_state", current_state())
         elif command_type == "set_host_tools":
             registered_host_tools = command.get("tools", [])
@@ -283,6 +369,9 @@ FAKE_SERVER = textwrap.dedent(
                 {"toolNames": [tool.get("name", "") for tool in registered_host_tools]},
             )
         elif command_type == "set_todos":
+            if "tasks" not in selected_capabilities:
+                respond(request_id, "set_todos", success=False, error="tasks capability was not selected")
+                continue
             todo_phases = command.get("phases", [])
             respond(request_id, "set_todos", {"todoPhases": todo_phases})
         elif command_type == "get_messages":
@@ -402,14 +491,129 @@ FAKE_SERVER = textwrap.dedent(
         elif command_type == "set_session_name":
             session_name = command["name"]
             respond(request_id, "set_session_name", {})
-        elif command_type in {"steer", "follow_up", "abort"}:
+        elif command_type in {"steer", "abort"}:
             respond(request_id, command_type, {})
+        elif command_type == "follow_up":
+            respond(request_id, command_type, {})
+            if command.get("clientTurnId"):
+                emit_prompt_turn("durable follow up")
         elif command_type in {"prompt", "abort_and_prompt"}:
-            respond(request_id, command_type, {})
             message = command["message"]
+            if command_type == "prompt" and message == "local response":
+                respond(request_id, command_type, {"agentInvoked": False})
+                continue
+            respond(request_id, command_type, {})
+            if command_type == "prompt" and message == "deferred local response":
+                print(
+                    json.dumps(
+                        {
+                            "type": "prompt_result",
+                            "id": request_id,
+                            "agentInvoked": False,
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
             if message == "needs ui":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-1", "method": "input", "title": "Need input", "placeholder": "value"}), flush=True)
                 continue
+            if message == "needs ask":
+                print(
+                    json.dumps(
+                        {
+                            "type": "extension_ui_request",
+                            "id": "ask-1",
+                            "method": "ask",
+                            "title": "Choose",
+                            "questions": [
+                                {
+                                    "id": "question-1",
+                                    "question": "Choose an option",
+                                    "options": [{"label": "A"}],
+                                }
+                            ],
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
+            if message in {
+                "needs approval",
+                "needs cancel-only approval",
+                "needs approve-only approval",
+            }:
+                if message == "needs approval":
+                    approval_id = "approval-deny"
+                    allowed_decisions = ["approve_once", "deny", "cancel"]
+                elif message == "needs cancel-only approval":
+                    approval_id = "approval-cancel"
+                    allowed_decisions = ["approve_once", "cancel"]
+                else:
+                    approval_id = "approval-approve-only"
+                    # No deny/cancel — fail-closed path must not pick approve_once.
+                    allowed_decisions = ["approve_once"]
+                print(
+                    json.dumps(
+                        {
+                            "type": "approval_request",
+                            "id": approval_id,
+                            "sessionId": "fake-session",
+                            "toolCallId": "tool-approval",
+                            "toolName": "bash",
+                            "approvalMode": "always-ask",
+                            "tier": "exec",
+                            "arguments": {"command": "pwd"},
+                            "details": ["pwd"],
+                            "providerSafetyChecks": [],
+                            "allowedDecisions": allowed_decisions,
+                        }
+                    ),
+                    flush=True,
+                )
+                continue
+            if message == "approval notifications":
+                print(
+                    json.dumps(
+                        {
+                            "type": "approval_request",
+                            "id": "approval-1",
+                            "sessionId": "fake-session",
+                            "toolCallId": "tool-1",
+                            "toolName": "bash",
+                            "approvalMode": "always-ask",
+                            "tier": "exec",
+                            "arguments": {"command": "pwd"},
+                            "details": ["pwd"],
+                            "providerSafetyChecks": [],
+                            "allowedDecisions": ["approve_once", "deny", "cancel"],
+                        }
+                    ),
+                    flush=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "type": "approval_resolved",
+                            "id": "approval-1",
+                            "outcome": "accepted",
+                            "decision": "approve_once",
+                        }
+                    ),
+                    flush=True,
+                )
+            if message == "ask notifications":
+                print(
+                    json.dumps(
+                        {
+                            "type": "extension_ui_resolved",
+                            "id": "ask-1",
+                            "method": "ask",
+                            "outcome": "cancelled",
+                        }
+                    ),
+                    flush=True,
+                )
             if message == "needs confirm":
                 print(json.dumps({"type": "extension_ui_request", "id": "ui-2", "method": "confirm", "title": "Confirm", "message": "Continue?"}), flush=True)
                 continue
@@ -916,6 +1120,66 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(decoded, frame)
 
+    def test_protocol_v2_chunks_oversized_commands(self) -> None:
+        client = RpcClient(command=["omp"])
+        client._protocol_version = 2
+        stdin = io.StringIO()
+        process = mock.Mock()
+        process.stdin = stdin
+        payload = {
+            "id": "large-command",
+            "type": "prompt",
+            "message": "x" * (1024 * 1024),
+        }
+
+        client._write_json(process, payload)
+
+        lines = stdin.getvalue().splitlines()
+        self.assertGreater(len(lines), 1)
+        decoder = _RpcFrameDecoder()
+        decoded = None
+        chunk_ids: set[str] = set()
+        for line in lines:
+            self.assertLessEqual(len(line.encode("utf-8")) + 1, 1024 * 1024)
+            frame = json.loads(line)
+            self.assertEqual(frame["type"], "rpc_chunk")
+            chunk_ids.add(frame["chunkId"])
+            decoded = decoder.push(frame)
+        self.assertEqual(chunk_ids, {"rpc-1"})
+        self.assertEqual(decoded, payload)
+
+    def test_oversized_ui_value_cancels_and_clears_pending_request(self) -> None:
+        client = RpcClient(command=["omp"])
+        request = ExtensionUiRequest(id="ui-oversized", method="input")
+        client._pending_ui_requests[request.id] = request
+        oversized_value = "oversized"
+        too_large = RpcFrameTooLargeError("RPC frame exceeded the protocol v2 reassembly limit")
+
+        with mock.patch.object(client, "_send_notification", side_effect=[too_large, None]) as send:
+            with self.assertRaises(RpcFrameTooLargeError):
+                client.send_ui_value(request.id, oversized_value)
+
+        self.assertNotIn(request.id, client._pending_ui_requests)
+        self.assertEqual(
+            send.call_args_list,
+            [
+                mock.call(
+                    {
+                        "type": "extension_ui_response",
+                        "id": request.id,
+                        "value": oversized_value,
+                    }
+                ),
+                mock.call(
+                    {
+                        "type": "extension_ui_response",
+                        "id": request.id,
+                        "cancelled": True,
+                    }
+                ),
+            ],
+        )
+
     def test_command_builder_supports_common_rpc_options(self) -> None:
         client = RpcClient(
             executable="omp",
@@ -984,6 +1248,75 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(turn.require_assistant_text(), "pong")
             self.assertGreaterEqual(len(turn.events), 3)
 
+    def test_prompt_wait_excludes_recovered_host_turn_events(self) -> None:
+        server = textwrap.dedent(
+            """
+            import json, sys
+            def respond(command, data=None):
+                print(json.dumps({"id": command["id"], "type": "response", "command": command["type"], "success": True, "data": data or {}}), flush=True)
+            print(json.dumps({"type": "ready", "capabilities": {"hostTurns": 1}}), flush=True)
+            for raw_line in sys.stdin:
+                command = json.loads(raw_line)
+                if command["type"] == "negotiate_capabilities":
+                    respond(command, {"capabilities": {"hostTurns": 1}})
+                    print(json.dumps({"type": "agent_start"}), flush=True)
+                    print(json.dumps({"type": "agent_end", "messages": []}), flush=True)
+                elif command["type"] == "get_state":
+                    respond(command)
+                elif command["type"] == "prompt":
+                    respond(command)
+                    print(json.dumps({"type": "agent_start"}), flush=True)
+                    print(json.dumps({"type": "agent_end", "messages": []}), flush=True)
+            """
+        )
+        with self.make_client(server) as client:
+            turn = client.prompt_and_wait("new turn", timeout=2.0)
+        self.assertEqual([event.type for event in turn.events], ["agent_start", "agent_end"])
+
+    def test_headless_policy_replays_startup_ui_requests(self) -> None:
+        server = textwrap.dedent(
+            """
+            import json, sys
+            confirmed = False
+            def respond(command, data=None):
+                print(json.dumps({"id": command["id"], "type": "response", "command": command["type"], "success": True, "data": data or {}}), flush=True)
+            print(json.dumps({"type": "ready", "capabilities": {"hostTurns": 1}}), flush=True)
+            for raw_line in sys.stdin:
+                command = json.loads(raw_line)
+                if command["type"] == "negotiate_capabilities":
+                    respond(command, {"capabilities": {"hostTurns": 1}})
+                    print(json.dumps({"type": "extension_ui_request", "id": "startup-confirm", "method": "confirm", "title": "Confirm", "message": "Continue?"}), flush=True)
+                elif command["type"] == "extension_ui_response":
+                    confirmed = command.get("confirmed") is True
+                elif command["type"] == "probe":
+                    respond(command, {"confirmed": confirmed})
+            """
+        )
+        with self.make_client(server) as client:
+            self.assertEqual(client.next_ui_request(timeout=2.0).id, "startup-confirm")
+            client.install_headless_ui(confirm=True)
+            self.assertEqual(client.request_raw("probe"), {"confirmed": True})
+
+    def test_prompt_and_wait_honors_immediate_local_completion(self) -> None:
+        with self.make_client() as client:
+            turn = client.prompt_and_wait(
+                "local response", client_turn_id="turn-local", timeout=0.2
+            )
+
+        self.assertEqual(turn.events, ())
+        self.assertIsNone(turn.assistant_text)
+
+    def test_prompt_and_wait_honors_deferred_local_completion(self) -> None:
+        with self.make_client() as client:
+            turn = client.prompt_and_wait(
+                "deferred local response",
+                client_turn_id="turn-deferred-local",
+                timeout=0.2,
+            )
+
+        self.assertEqual(turn.events, ())
+        self.assertIsNone(turn.assistant_text)
+
     def test_prompt_and_wait_reconstructs_compacted_terminal_messages(self) -> None:
         with self.make_client() as client:
             turn = client.prompt_and_wait("compacted turn", timeout=2.0)
@@ -993,6 +1326,147 @@ class RpcClientTests(unittest.TestCase):
             ["pong", "terminal"],
         )
         self.assertEqual(turn.require_assistant_text(), "terminal")
+
+    def test_custom_tools_install_before_host_turns_negotiation(self) -> None:
+        server = textwrap.dedent(
+            """
+            import json
+            import sys
+
+            host_tools_installed = False
+            print(json.dumps({"type": "ready", "capabilities": {"hostTurns": 1}}), flush=True)
+            for raw_line in sys.stdin:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                command = json.loads(raw_line)
+                request_id = command.get("id")
+                command_type = command.get("type")
+                if command_type == "set_host_tools":
+                    host_tools_installed = True
+                    print(
+                        json.dumps(
+                            {
+                                "id": request_id,
+                                "type": "response",
+                                "command": "set_host_tools",
+                                "success": True,
+                                "data": {
+                                    "toolNames": [
+                                        tool.get("name", "")
+                                        for tool in command.get("tools", [])
+                                    ]
+                                },
+                            }
+                        ),
+                        flush=True,
+                    )
+                elif command_type == "negotiate_capabilities":
+                    print(
+                        json.dumps(
+                            {
+                                "id": request_id,
+                                "type": "response",
+                                "command": "negotiate_capabilities",
+                                "success": host_tools_installed,
+                                **(
+                                    {"data": {"capabilities": {"hostTurns": 1}}}
+                                    if host_tools_installed
+                                    else {
+                                        "error": "host tools were not installed before hostTurns negotiation"
+                                    }
+                                ),
+                            }
+                        ),
+                        flush=True,
+                    )
+            """
+        )
+
+        with self.make_client(
+            server=server,
+            custom_tools=(
+                host_tool(
+                    name="host_ready",
+                    description="Marks the host tool surface ready",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    execute=lambda _args, _context: "ready",
+                ),
+            ),
+        ) as client:
+            self.assertEqual(client.selected_capabilities.to_wire(), {"hostTurns": 1})
+
+    def test_host_uris_install_before_host_turns_negotiation(self) -> None:
+        server = textwrap.dedent(
+            """
+            import json
+            import sys
+
+            host_uris_installed = False
+            print(json.dumps({"type": "ready", "capabilities": {"hostTurns": 1}}), flush=True)
+            for raw_line in sys.stdin:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                command = json.loads(raw_line)
+                request_id = command.get("id")
+                command_type = command.get("type")
+                if command_type == "set_host_uri_schemes":
+                    host_uris_installed = True
+                    print(
+                        json.dumps(
+                            {
+                                "id": request_id,
+                                "type": "response",
+                                "command": "set_host_uri_schemes",
+                                "success": True,
+                                "data": {
+                                    "schemes": [
+                                        scheme.get("scheme", "")
+                                        for scheme in command.get("schemes", [])
+                                    ]
+                                },
+                            }
+                        ),
+                        flush=True,
+                    )
+                elif command_type == "negotiate_capabilities":
+                    print(
+                        json.dumps(
+                            {
+                                "id": request_id,
+                                "type": "response",
+                                "command": "negotiate_capabilities",
+                                "success": host_uris_installed,
+                                **(
+                                    {"data": {"capabilities": {"hostTurns": 1}}}
+                                    if host_uris_installed
+                                    else {
+                                        "error": "host uris were not installed before hostTurns negotiation"
+                                    }
+                                ),
+                            }
+                        ),
+                        flush=True,
+                    )
+            """
+        )
+
+        with self.make_client(
+            server=server,
+            host_uris=(
+                host_uri(
+                    scheme="db",
+                    description="Marks the host URI surface ready",
+                    read=lambda _url, _context: "ready",
+                ),
+            ),
+        ) as client:
+            self.assertEqual(client.selected_capabilities.to_wire(), {"hostTurns": 1})
 
     def test_custom_tools_are_registered_and_executed_via_rpc(self) -> None:
         def echo_host(args: dict[str, str], context) -> str:
@@ -1112,6 +1586,104 @@ class RpcClientTests(unittest.TestCase):
 
         self.assertEqual(seen_methods, ["input"])
 
+    def test_install_headless_ui_cancels_rich_ask_requests(self) -> None:
+        seen_methods: list[str] = []
+
+        with self.make_client() as client:
+            client.install_headless_ui(
+                on_request=lambda request: seen_methods.append(request.method)
+            )
+            turn = client.prompt_and_wait("needs ask", timeout=2.0)
+
+        self.assertEqual(seen_methods, ["ask"])
+        self.assertEqual(turn.require_assistant_text(), "ui acknowledged")
+
+    def test_install_headless_ui_denies_structured_approvals(self) -> None:
+        with self.make_client() as client:
+            client.install_headless_ui()
+            turn = client.prompt_and_wait("needs approval", timeout=2.0)
+
+        self.assertEqual(turn.require_assistant_text(), "approval deny")
+        self.assertNotIn("approval_request", [event.type for event in turn.events])
+
+    def test_install_headless_ui_cancels_when_denial_is_unavailable(self) -> None:
+        with self.make_client() as client:
+            client.install_headless_ui()
+            turn = client.prompt_and_wait("needs cancel-only approval", timeout=2.0)
+
+        self.assertEqual(turn.require_assistant_text(), "approval cancel")
+
+    def test_install_headless_ui_never_approves_when_only_approve_allowed(self) -> None:
+        """When deny/cancel are absent, headless must not use allowed_decisions[0]."""
+        with self.make_client() as client:
+            client.install_headless_ui()
+            turn = client.prompt_and_wait(
+                "needs approve-only approval", timeout=2.0
+            )
+
+        self.assertEqual(turn.require_assistant_text(), "approval cancel")
+        self.assertNotEqual(turn.require_assistant_text(), "approval approve_once")
+
+    def test_install_headless_ui_cleanup_removes_all_handlers(self) -> None:
+        client = self.make_client()
+        remove_ui_observer = client.on_ui_request(lambda request: None)
+        remove_approval_observer = client.on_approval_request(lambda request: None)
+        cleanup = client.install_headless_ui()
+
+        self.assertEqual(len(client._ui_request_listeners), 2)
+        self.assertEqual(len(client._approval_request_listeners), 2)
+
+        cleanup()
+        cleanup()
+
+        self.assertEqual(len(client._ui_request_listeners), 1)
+        self.assertEqual(len(client._approval_request_listeners), 1)
+        remove_ui_observer()
+        remove_approval_observer()
+
+    def test_approval_notifications_do_not_enter_agent_event_streams(self) -> None:
+        notifications: list[object] = []
+        event_types: list[str] = []
+
+        with self.make_client() as client:
+            client.on_notification(notifications.append)
+            client.on_event(lambda event: event_types.append(event.type))
+            turn = client.prompt_and_wait("approval notifications", timeout=2.0)
+
+        approvals = [
+            notification
+            for notification in notifications
+            if isinstance(notification, (ApprovalRequest, ApprovalResolved))
+        ]
+        self.assertEqual(
+            [type(notification) for notification in approvals],
+            [ApprovalRequest, ApprovalResolved],
+        )
+        self.assertEqual(approvals[0].id, "approval-1")
+        self.assertNotIn("approval_request", event_types)
+        self.assertNotIn("approval_resolved", event_types)
+        self.assertNotIn("approval_request", [event.type for event in turn.events])
+        self.assertNotIn("approval_resolved", [event.type for event in turn.events])
+
+    def test_ask_resolved_does_not_enter_agent_event_streams(self) -> None:
+        notifications: list[object] = []
+        event_types: list[str] = []
+
+        with self.make_client() as client:
+            client.on_notification(notifications.append)
+            client.on_event(lambda event: event_types.append(event.type))
+            turn = client.prompt_and_wait("ask notifications", timeout=2.0)
+
+        resolutions = [
+            notification
+            for notification in notifications
+            if isinstance(notification, AskResolved)
+        ]
+        self.assertEqual(len(resolutions), 1)
+        self.assertEqual(resolutions[0].id, "ask-1")
+        self.assertNotIn("extension_ui_resolved", event_types)
+        self.assertNotIn("extension_ui_resolved", [event.type for event in turn.events])
+
     def test_ready_and_typed_event_listeners(self) -> None:
         ready_types: list[str] = []
         event_types: list[str] = []
@@ -1136,6 +1708,77 @@ class RpcClientTests(unittest.TestCase):
         self.assertIn("ready", notification_types)
         self.assertIn("turn_start", notification_types)
         self.assertIn("agent_end", notification_types)
+
+    def test_default_capabilities_select_only_supported_python_apis(self) -> None:
+        with self.make_client() as client:
+            self.assertEqual(client.offered_capabilities.structured_approvals, 2)
+            self.assertEqual(
+                client.selected_capabilities.to_wire(),
+                {
+                    "structuredApprovals": 1,
+                    "runtimePolicy": 1,
+                    "authStatus": 1,
+                    "richUserInput": 1,
+                    "hostTurns": 1,
+                    "modelCatalog": 1,
+                    "skills": 1,
+                    "tasks": 1,
+                },
+            )
+            self.assertIsNone(client.selected_capabilities.plan_control)
+            self.assertIsNone(client.selected_capabilities.plan_review)
+            self.assertIsNone(client.selected_capabilities.slash_commands)
+            self.assertIsNone(client.selected_capabilities.subagents)
+
+    def test_semantic_capabilities_and_metadata_apis(self) -> None:
+        with self.make_client(
+            capabilities={
+                "runtimePolicy": 1,
+                "authStatus": 1,
+                "modelCatalog": 1,
+                "skills": 1,
+                "structuredApprovals": 5,
+                "richUserInput": 1,
+            }
+        ) as client:
+            self.assertEqual(client.offered_capabilities.runtime_policy, 1)
+            self.assertEqual(client.selected_capabilities.model_catalog, 1)
+            self.assertIsNone(client.selected_capabilities.slash_commands)
+            self.assertEqual(
+                client.selected_capabilities.to_wire(),
+                {
+                    "structuredApprovals": 1,
+                    "runtimePolicy": 1,
+                    "authStatus": 1,
+                    "richUserInput": 1,
+                    "modelCatalog": 1,
+                    "skills": 1,
+                },
+            )
+
+            policy = client.set_runtime_policy("write")
+            self.assertEqual(policy.approval_mode, "write")
+            self.assertEqual(client.get_state().approval_mode, "write")
+
+            auth = client.get_auth_status()
+            self.assertEqual(auth.providers[0].provider, "anthropic")
+            self.assertEqual(auth.providers[0].accounts[0].email, "dev@example.com")
+
+            models = client.get_available_models()
+            self.assertEqual(models[0].thinking_efforts, ("low", "high"))
+            self.assertTrue(models[0].fast_mode_supported)
+
+            skills = client.get_available_skills()
+            self.assertEqual(skills[0].name, "reviewer")
+            self.assertEqual(skills[0].source, "project")
+
+            client.respond_to_approval("approval-1", "approve_once")
+            client.respond_to_ask("ask-1", AskDialogChatResult())
+
+    def test_legacy_ready_omission_skips_semantic_negotiation(self) -> None:
+        with self.make_client(server=IDLESS_ERROR_SERVER) as client:
+            self.assertIsNone(client.offered_capabilities.runtime_policy)
+            self.assertIsNone(client.selected_capabilities.runtime_policy)
 
     def test_set_todos_supports_flat_items(self) -> None:
         with self.make_client() as client:
@@ -1205,6 +1848,232 @@ class RpcClientTests(unittest.TestCase):
             branch_messages = client.get_branch_messages()
             self.assertEqual(branch_messages[0].entry_id, "entry-9")
 
+    def test_follow_up_preserves_legacy_and_durable_call_shapes(self) -> None:
+        client = self.make_client()
+        images: tuple[ImageContent, ...] = (
+            {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+        )
+
+        with mock.patch.object(client, "_request", return_value={}) as request:
+            client.follow_up("legacy without images")
+            client.follow_up("legacy with images", images=images)
+            client.follow_up(
+                "durable",
+                client_turn_id="turn-1",
+                option_fingerprint="options-1",
+                images=images,
+                turn_options={"modelId": "claude-sonnet-4-6", "fastMode": True},
+            )
+
+            self.assertEqual(
+                request.call_args_list,
+                [
+                    mock.call("follow_up", message="legacy without images"),
+                    mock.call(
+                        "follow_up", message="legacy with images", images=list(images)
+                    ),
+                    mock.call(
+                        "follow_up",
+                        message="durable",
+                        images=list(images),
+                        clientTurnId="turn-1",
+                        optionFingerprint="options-1",
+                        turnOptions={
+                            "modelId": "claude-sonnet-4-6",
+                            "fastMode": True,
+                        },
+                    ),
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "client_turn_id and option_fingerprint are both required",
+            ):
+                client.follow_up("invalid", client_turn_id="turn-only")
+
+            self.assertEqual(request.call_count, 3)
+
+    def test_prompt_does_not_expose_ignored_turn_options(self) -> None:
+        client = self.make_client()
+
+        with mock.patch.object(client, "_request", return_value={}) as request:
+            client.prompt("hello", client_turn_id="turn-1")
+            self.assertEqual(
+                request.call_args_list,
+                [
+                    mock.call(
+                        "prompt",
+                        message="hello",
+                        images=None,
+                        streamingBehavior=None,
+                        clientTurnId="turn-1",
+                    )
+                ],
+            )
+
+            with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+                client.prompt("hello", turn_options={"modelId": "x"})
+            with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+                client.prompt_and_wait("hello", turn_options={"modelId": "x"})
+
+    def test_startup_host_tool_registration_failure_stops_process(self) -> None:
+        server = textwrap.dedent(
+            """
+            import json
+            import sys
+
+            print(json.dumps({"type": "ready", "capabilities": {"hostTurns": 1}}), flush=True)
+            for raw_line in sys.stdin:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                command = json.loads(raw_line)
+                request_id = command.get("id")
+                command_type = command.get("type")
+                if command_type == "set_host_tools":
+                    print(
+                        json.dumps(
+                            {
+                                "id": request_id,
+                                "type": "response",
+                                "command": "set_host_tools",
+                                "success": False,
+                                "error": "host tools rejected",
+                            }
+                        ),
+                        flush=True,
+                    )
+            """
+        )
+        client = self.make_client(
+            server=server,
+            custom_tools=(
+                host_tool(
+                    name="host_ready",
+                    description="Marks the host tool surface ready",
+                    parameters={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    execute=lambda _args, _context: "ready",
+                ),
+            ),
+        )
+
+        with self.assertRaises(RpcCommandError) as ctx:
+            client.start()
+
+        self.assertEqual(ctx.exception.command, "set_host_tools")
+        self.assertIn("host tools rejected", ctx.exception.error)
+        self.assertIsNone(client._process)
+
+        # stop() cleared the process so a later start is not blocked as "already started"
+        with self.assertRaises(RpcCommandError):
+            client.start()
+        self.assertIsNone(client._process)
+
+    def test_recovery_approval_is_retained_until_listener_registration(
+        self,
+    ) -> None:
+        """A recovery approval emitted during start remains actionable afterward."""
+        server = textwrap.dedent(
+            """
+            import json
+            import sys
+
+            print(
+                json.dumps(
+                    {
+                        "type": "ready",
+                        "capabilities": {
+                            "structuredApprovals": 1,
+                            "hostTurns": 1,
+                        },
+                    }
+                ),
+                flush=True,
+            )
+            for raw_line in sys.stdin:
+                raw_line = raw_line.strip()
+                if not raw_line:
+                    continue
+                command = json.loads(raw_line)
+                request_id = command.get("id")
+                command_type = command.get("type")
+                if command_type == "negotiate_capabilities":
+                    print(
+                        json.dumps(
+                            {
+                                "id": request_id,
+                                "type": "response",
+                                "command": "negotiate_capabilities",
+                                "success": True,
+                                "data": {
+                                    "capabilities": {
+                                        "structuredApprovals": 1,
+                                        "hostTurns": 1,
+                                    }
+                                },
+                            }
+                        ),
+                        flush=True,
+                    )
+                    print(
+                        json.dumps(
+                            {
+                                "type": "approval_request",
+                                "id": "approval-recovery-1",
+                                "sessionId": "fake-session",
+                                "toolCallId": "call-1",
+                                "toolName": "bash",
+                                "approvalMode": "always-ask",
+                                "tier": "exec",
+                                "arguments": {"command": "echo hi"},
+                                "details": ["echo hi"],
+                                "providerSafetyChecks": [],
+                                "allowedDecisions": [
+                                    "approve_once",
+                                    "deny",
+                                    "cancel",
+                                ],
+                            }
+                        ),
+                        flush=True,
+                    )
+                elif command_type == "approval_response":
+                    continue
+            """
+        )
+        recovery_errors: list[BaseException] = []
+        recovery_seen = threading.Event()
+        client = self.make_client(server=server)
+
+        def on_approval(request: ApprovalRequest) -> None:
+            try:
+                client.respond_to_approval(request.id, "approve_once")
+            except BaseException as exc:
+                recovery_errors.append(exc)
+            finally:
+                recovery_seen.set()
+
+
+        try:
+            client.start()
+            client.on_approval_request(on_approval)
+            self.assertTrue(
+                recovery_seen.wait(2.0),
+                "expected recovery approval_request during startup",
+            )
+            self.assertEqual(
+                client.selected_capabilities.to_wire(),
+                {"structuredApprovals": 1, "hostTurns": 1},
+            )
+            self.assertEqual(recovery_errors, [])
+        finally:
+            client.stop()
+
     def test_message_and_control_commands(self) -> None:
         with self.make_client() as client:
             turn = client.prompt_and_wait("say hello", timeout=2.0)
@@ -1219,7 +2088,10 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(client.get_todos(), ())
 
             client.steer("nudge")
-            client.follow_up("later")
+            client.follow_up(
+                "later", client_turn_id="turn-later", option_fingerprint="opts-later"
+            )
+            client.wait_for_idle(timeout=2.0)
             client.abort()
             client.abort_retry()
             client.abort_bash()
@@ -1353,9 +2225,7 @@ class RpcClientTests(unittest.TestCase):
             client.on_unknown_notification(
                 lambda event: unknown_errors.append(event.parse_error)
             )
-            with self.assertRaisesRegex(
-                RpcError, "Failed to parse terminal agent_end"
-            ):
+            with self.assertRaisesRegex(RpcError, "Failed to parse terminal agent_end"):
                 client.prompt_and_wait("malformed terminal", timeout=1.0)
 
         self.assertEqual(len(unknown_errors), 1)

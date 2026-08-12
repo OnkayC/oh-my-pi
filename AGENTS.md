@@ -29,6 +29,7 @@ Unless user tells you exactly what to write:
 
 - **Never comment on GitHub** (issues, PRs, discussions).
 - **Never create issues on GitHub**.
+- Codex review auto-starts on each new commit push. Never post `@codex review` (or similar manual review triggers); push the commit and wait for the automatic review.
 
 ## Code Quality
 

@@ -3,6 +3,7 @@ name: CI
 on:
    push:
       branches: [main]
+      tags: ["v*"]
       paths:
          - "packages/**"
          - "crates/**"
@@ -55,17 +56,12 @@ on:
             type: boolean
             default: false
 
-# Release runs publish a `v*` tag pushed atomically with main HEAD; sharing
-# the cheap branch-wide `CI-refs/heads/main` group meant a later main push
-# silently cancelled the in-flight release and left the tag without a GitHub
-# Release or npm publish (#2564). Detect release runs at workflow-scheduling
-# time via the release-script commit subject (`chore: bump version to vX.Y.Z`),
-# via `v*` tag-ref dispatches, and via manual dispatches whose tag-on-HEAD
-# status is only known after checkout; scope them to a per-sha group with no
-# cancellation. Every other event keeps branch-wide cancellation for PR/main churn.
+# Tag pushes are authoritative release runs. Keep them in a per-SHA group so
+# ordinary main/PR churn cannot cancel publication; non-release runs retain
+# branch-wide cancellation.
 concurrency:
-   group: "${{ github.workflow }}-${{ (startsWith(github.event.head_commit.message, 'chore: bump version to ') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && format('release-{0}', github.sha) || github.ref }}"
-   cancel-in-progress: "${{ !(startsWith(github.event.head_commit.message, 'chore: bump version to ') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}"
+   group: "${{ github.workflow }}-${{ startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.sha) || github.ref }}"
+   cancel-in-progress: "${{ !startsWith(github.ref, 'refs/tags/v') }}"
 
 env:
    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -74,54 +70,31 @@ permissions:
    contents: read
 
 jobs:
-   # scripts/release.ts pushes the version-bump commit and its `v*` tag
-   # atomically (`git push --atomic origin refs/heads/main:refs/heads/main
-   # <sha>:refs/tags/v<version>`), so a release now arrives as a single `push` to
-   # `refs/heads/main` — we no longer trigger on the tag ref at all (see
-   # `on.push`). This one branch-push run is therefore authoritative: it runs the
-   # full build AND, when HEAD carries a release tag, the release/publish jobs.
-   # `release_metadata` resolves that tag once so downstream jobs switch on
-   # `is-release` and address the tag by name — `github.ref` is
-   # `refs/heads/main` here, not the tag. A `workflow_dispatch` from a `v*` tag
-   # ref (or from a tagged main HEAD) is also treated as a release.
+   # Release/publish jobs run only for a pushed `v*` tag. Main pushes still run
+   # validation, but carrying a tag at HEAD no longer turns the branch run into
+   # a second release.
    release_metadata:
       name: Resolve release metadata
-      # Hosted, not omp-kata: this ~20 s git-tag probe gates the whole release
-      # chain, and queueing it behind the 4-runner kata pool adds dead minutes
-      # to the darwin critical path.
+      # Hosted so the tag probe gates release jobs without occupying a build
+      # runner.
       runs-on: ubuntu-22.04
       outputs:
          is-release: ${{ steps.detect.outputs.is-release }}
          release-tag: ${{ steps.detect.outputs.release-tag }}
       steps:
-         # Only a main-branch run needs tags fetched, so `git tag --points-at
-         # HEAD` can see the freshly-pushed `v*`. A tag-ref dispatch reads the
-         # tag straight from `github.ref_name`, and fetching `--tags` while
-         # checkout uses an explicit tag refspec makes git refuse — so scope
-         # fetch-tags to main refs.
-         - uses: actions/checkout@v4
-           with:
-              fetch-tags: ${{ github.ref == 'refs/heads/main' }}
-         - name: Detect release tag at HEAD
+         - name: Detect release tag
            id: detect
            shell: bash
            run: |
               is_release=false
               release_tag=""
-              case "${{ github.ref }}" in
+              case "$GITHUB_REF" in
                 refs/tags/v[0-9]*)
-                  release_tag="${{ github.ref_name }}"
-                  ;;
-                refs/heads/main)
-                  if [ "${{ github.event_name }}" != "pull_request" ]; then
-                    release_tag=$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -n1 || true)
-                  fi
+                  release_tag="$GITHUB_REF_NAME"
+                  is_release=true
+                  echo "Tag $release_tag triggers a release."
                   ;;
               esac
-              if [ -n "$release_tag" ]; then
-                echo "HEAD carries release tag $release_tag; this run builds and publishes the release."
-                is_release=true
-              fi
               {
                 echo "is-release=$is_release"
                 echo "release-tag=$release_tag"
@@ -129,7 +102,7 @@ jobs:
 
    check:
       name: Lint, type check & web build
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || (github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata') }}
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -146,9 +119,29 @@ jobs:
    rust_validate:
       name: Validate Rust workspace (bazel)
       if: github.event_name != 'pull_request'
-      runs-on: omp-kata
+      runs-on: ${{ github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata' }}
       steps:
          - uses: actions/checkout@v4
+         - uses: bazelbuild/setup-bazelisk@v3
+           if: github.repository_owner == 'OnkayC'
+         - name: Expose Bazelisk command
+           if: github.repository_owner == 'OnkayC'
+           run: |
+              mkdir -p "$RUNNER_TEMP/bin"
+              ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
+              echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+         - uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3
+           if: github.repository_owner == 'OnkayC'
+           with:
+              cmake-version: 3.31.x
+         - uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
+           if: github.repository_owner == 'OnkayC'
+         - name: Expose native build tools
+           if: github.repository_owner == 'OnkayC'
+           run: |
+              mkdir -p "$HOME/.local/bin"
+              ln -sf "$(command -v cmake)" "$HOME/.local/bin/cmake"
+              ln -sf "$(command -v ninja)" "$HOME/.local/bin/ninja"
          - uses: ./.github/actions/bun-install
          - id: cache
            uses: ./.github/actions/bazel-cache
@@ -192,9 +185,29 @@ jobs:
    # bazel. Job name says "bazel" for continuity with required checks.
    native_addons:
       name: Build native addons (bazel)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || (github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata') }}
       steps:
          - uses: actions/checkout@v4
+         - uses: bazelbuild/setup-bazelisk@v3
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+         - name: Expose Bazelisk command
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+           run: |
+              mkdir -p "$RUNNER_TEMP/bin"
+              ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
+              echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+         - uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+           with:
+              cmake-version: 3.31.x
+         - uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+         - name: Expose native build tools
+           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
+           run: |
+              mkdir -p "$HOME/.local/bin"
+              ln -sf "$(command -v cmake)" "$HOME/.local/bin/cmake"
+              ln -sf "$(command -v ninja)" "$HOME/.local/bin/ninja"
 
          # ---- PR path: latest release addons from npm ----
          - name: Fetch release native addons (npm)
@@ -300,7 +313,7 @@ jobs:
 
    test_workspace:
       name: Test TS workspace fast
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 20
@@ -323,7 +336,7 @@ jobs:
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 20
@@ -341,7 +354,7 @@ jobs:
 
    test_ts_native:
       name: Test TS native/integration packages
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -359,7 +372,7 @@ jobs:
 
    test_coding_agent_ui:
       name: Test coding-agent UI/TUI (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -377,7 +390,7 @@ jobs:
 
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -397,7 +410,7 @@ jobs:
 
    test_coding_agent_native:
       name: Test coding-agent native/unit (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -421,7 +434,7 @@ jobs:
 
    test_smoke:
       name: Test CLI smoke (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 15
@@ -437,7 +450,7 @@ jobs:
 
    install_methods:
       name: Install method smoke tests
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-22.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       steps:
@@ -593,12 +606,6 @@ jobs:
          matrix:
             include:
                - {
-                    os: macos-15-intel,
-                    target_id: darwin-x64,
-                    binary_path: packages/coding-agent/binaries/omp-darwin-x64,
-                    native_targets: darwin-x64-baseline,
-                 }
-               - {
                     os: macos-14,
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/omp-darwin-arm64,
@@ -673,6 +680,7 @@ jobs:
    release_native_leaves:
       name: Publish native leaf packages
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
+         github.repository == 'can1357/oh-my-pi' &&
          needs.release_gate.result == 'success' &&
          needs.release_binary.result == 'success' &&
          needs.release_binary_darwin.result == 'success' &&
@@ -819,6 +827,7 @@ jobs:
    release_npm:
       name: Publish to npm
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
+         github.repository == 'can1357/oh-my-pi' &&
          needs.release_binary.result == 'success' &&
          needs.release_binary_darwin.result == 'success' &&
          needs.release_github_verify.result == 'success' &&
