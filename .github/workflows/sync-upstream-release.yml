@@ -26,11 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          token: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
           fetch-depth: 0
 
       - name: Merge release or open conflict pull request
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
