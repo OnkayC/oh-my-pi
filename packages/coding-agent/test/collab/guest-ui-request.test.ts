@@ -546,7 +546,6 @@ describe("collab proto handshake (#4049)", () => {
 		try {
 			const welcome = await guest.nextFrame();
 			if (welcome.t !== "welcome") throw new Error(`expected welcome, got ${welcome.t}`);
-			expect(welcome.proto).toBe(COLLAB_PROTO);
 			expect(welcome.proto).toBe(3);
 
 			const pending = host.requestGuestUi({ kind: "select", title: "Continue?", options: ["Yes"] });

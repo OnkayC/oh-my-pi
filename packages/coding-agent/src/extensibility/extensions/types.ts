@@ -87,6 +87,8 @@ import type {
 	AutoRetryStartEvent,
 	ContextEvent,
 	GoalUpdatedEvent,
+	RetryFallbackAppliedEvent,
+	RetryFallbackSucceededEvent,
 	SessionBeforeBranchEvent,
 	SessionBeforeBranchResult,
 	SessionBeforeCompactEvent,
@@ -757,7 +759,10 @@ export interface MessageUpdateEvent {
 	assistantMessageEvent: AssistantMessageEvent;
 }
 
-/** Fired when a message ends */
+/**
+ * Fired when a message ends. Notification-only: the message is a detached
+ * snapshot, so in-place changes do not rewrite agent or provider context.
+ */
 export interface MessageEndEvent {
 	type: "message_end";
 	message: AgentMessage;
@@ -795,6 +800,8 @@ export type {
 	AutoCompactionStartEvent,
 	AutoRetryEndEvent,
 	AutoRetryStartEvent,
+	RetryFallbackAppliedEvent,
+	RetryFallbackSucceededEvent,
 	TodoReminderEvent,
 	TtsrTriggeredEvent,
 } from "../shared-events";
@@ -1057,6 +1064,8 @@ export type ExtensionEvent =
 	| AutoCompactionEndEvent
 	| AutoRetryStartEvent
 	| AutoRetryEndEvent
+	| RetryFallbackAppliedEvent
+	| RetryFallbackSucceededEvent
 	| TtsrTriggeredEvent
 	| TodoReminderEvent
 	| GoalUpdatedEvent
@@ -1244,6 +1253,8 @@ export interface ExtensionAPI {
 	on(event: "auto_compaction_end", handler: ExtensionHandler<AutoCompactionEndEvent>): void;
 	on(event: "auto_retry_start", handler: ExtensionHandler<AutoRetryStartEvent>): void;
 	on(event: "auto_retry_end", handler: ExtensionHandler<AutoRetryEndEvent>): void;
+	on(event: "retry_fallback_applied", handler: ExtensionHandler<RetryFallbackAppliedEvent>): void;
+	on(event: "retry_fallback_succeeded", handler: ExtensionHandler<RetryFallbackSucceededEvent>): void;
 	on(event: "ttsr_triggered", handler: ExtensionHandler<TtsrTriggeredEvent>): void;
 	on(event: "todo_reminder", handler: ExtensionHandler<TodoReminderEvent>): void;
 	on(event: "goal_updated", handler: ExtensionHandler<GoalUpdatedEvent>): void;

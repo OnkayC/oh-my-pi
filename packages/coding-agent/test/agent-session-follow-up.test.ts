@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
-import { Agent } from "@oh-my-pi/pi-agent-core";
+import { type } from "@oh-my-pi/omptype";
+import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -17,6 +18,14 @@ import { assistantMsg, userMsg } from "./utilities";
 afterEach(() => {
 	vi.restoreAllMocks();
 });
+
+const mockTaskTool: AgentTool = {
+	name: "task",
+	label: "Task",
+	description: "Mock task tool",
+	parameters: type({}),
+	execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+};
 
 describe("AgentSession follow-up lifecycle and options", () => {
 	it("queues one idempotent follow-up, applies options before its provider call, and clears promotion state", async () => {
@@ -491,7 +500,7 @@ describe("AgentSession follow-up lifecycle and options", () => {
 		let callCount = 0;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			initialState: { model, systemPrompt: ["Test"], tools: [mockTaskTool] },
 			followUpMode: "all",
 			streamFn: () => {
 				const stream = new AssistantMessageEventStream();
