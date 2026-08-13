@@ -597,6 +597,12 @@ export class ExtensionUiController {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined> {
+		const unanswerable = questions.find(
+			question => question.multi !== true && question.allowCustom === false && question.options.length === 0,
+		);
+		if (unanswerable) {
+			throw new Error(`Ask question ${unanswerable.id} has no selectable or custom answer`);
+		}
 		const host = this.ctx.collabHost;
 		if (!host) return this.#showLocalAskDialog(questions, dialogOptions);
 		const localAbort = new AbortController();
@@ -767,6 +773,7 @@ export class ExtensionUiController {
 	): Promise<ExtensionAskDialogResultItem | "chat" | "unavailable" | undefined> {
 		const selected = new Set<string>();
 		let customInput: string | undefined;
+		const allowCustom = question.allowCustom !== false;
 		const baseOptions: CollabUiSelectItem[] = question.options.map(option =>
 			option.description?.trim() ? { label: option.label, description: option.description.trim() } : option.label,
 		);
@@ -781,7 +788,8 @@ export class ExtensionUiController {
 				// (PRRT_kwDOQxs0bc6OFbDW). The remote select has no "disabled" row
 				// concept, so we omit rather than dim it.
 				const hasAnswer = selected.size > 0 || customInput !== undefined;
-				const options = [...baseOptions, ASK_OTHER_OPTION];
+				const options = [...baseOptions];
+				if (allowCustom) options.push(ASK_OTHER_OPTION);
 				if (hasAnswer) options.push(ASK_NEXT_OPTION);
 				options.push(ASK_CHAT_OPTION);
 				const choice = await this.#requestGuestUiString(
@@ -802,7 +810,7 @@ export class ExtensionUiController {
 				if (choice.kind === "cancelled") return undefined;
 				if (choice.value === ASK_CHAT_OPTION) return "chat";
 				if (choice.value === ASK_NEXT_OPTION) break;
-				if (choice.value === ASK_OTHER_OPTION) {
+				if (allowCustom && choice.value === ASK_OTHER_OPTION) {
 					const input = await this.#requestGuestUiString(
 						{ kind: "editor", title: boundPromptTitle("Custom answer: ", question.question) },
 						signal,
@@ -828,7 +836,7 @@ export class ExtensionUiController {
 					{
 						kind: "select",
 						title: question.question,
-						options: [...baseOptions, ASK_OTHER_OPTION, ASK_CHAT_OPTION],
+						options: [...baseOptions, ...(allowCustom ? [ASK_OTHER_OPTION] : []), ASK_CHAT_OPTION],
 						initialIndex,
 						selectionMarker: "radio",
 						markableCount: question.options.length,
@@ -839,7 +847,7 @@ export class ExtensionUiController {
 				if (choice.kind === "unavailable") return "unavailable";
 				if (choice.kind === "cancelled") return undefined;
 				if (choice.value === ASK_CHAT_OPTION) return "chat";
-				if (choice.value === ASK_OTHER_OPTION) {
+				if (allowCustom && choice.value === ASK_OTHER_OPTION) {
 					const input = await this.#requestGuestUiString(
 						{ kind: "editor", title: boundPromptTitle("Custom answer: ", question.question) },
 						signal,

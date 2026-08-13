@@ -78,6 +78,28 @@ describe("AskDialogComponent", () => {
 		});
 	});
 
+	it("omits the custom-answer row when allowCustom is false", () => {
+		const onSubmit = vi.fn();
+		const onPrompt = vi.fn();
+		const component = new AskDialogComponent(
+			[
+				{
+					id: "q1",
+					question: "Choose one?",
+					options: [{ label: "Option A" }, { label: "Option B" }],
+					allowCustom: false,
+				},
+			],
+			{ onSubmit, onCancel: vi.fn(), onPrompt },
+		);
+
+		expect(render(component)).not.toContain("Other (type your own)");
+		component.handleInput(DOWN);
+		component.handleInput(ENTER);
+		expect(onPrompt).not.toHaveBeenCalled();
+		expect(onSubmit.mock.calls[0][0].results[0].selectedOptions).toEqual(["Option B"]);
+	});
+
 	it("single-question, single-select: Space does not submit the highlighted answer", () => {
 		const onSubmit = vi.fn();
 		const questions: ExtensionAskDialogQuestion[] = [

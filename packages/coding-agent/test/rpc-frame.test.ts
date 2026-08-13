@@ -20,6 +20,11 @@ function oversizedMessageHistory(prefix: string) {
 }
 
 describe("RPC frame encoding", () => {
+	it("keeps 1 MiB physical frames under the stable 64 MiB logical ceiling", () => {
+		expect(MAX_RPC_FRAME_BYTES).toBe(1024 * 1024);
+		expect(MAX_RPC_REASSEMBLED_BYTES).toBe(64 * 1024 * 1024);
+	});
+
 	it("preserves fitting frames and serializes stateful message frames once", () => {
 		const frame = { id: "request-1", type: "response", command: "get_state", success: true, data: { ok: true } };
 		expect(encodeRpcFrame(frame)).toBe(`${JSON.stringify(frame)}\n`);
@@ -279,6 +284,22 @@ describe("RPC frame encoding", () => {
 			success: false,
 			error: "RPC response exceeded the transport limit",
 		});
+	});
+
+	it("can reject an oversized protocol v2 logical frame without rewriting its type", () => {
+		const encoder = new RpcFrameEncoder();
+		encoder.setProtocolVersion(2);
+
+		expect(() =>
+			encoder.encodeFrames(
+				{
+					id: "request-too-large",
+					type: "prompt",
+					message: "x".repeat(MAX_RPC_REASSEMBLED_BYTES),
+				},
+				{ rejectOversizedLogicalFrame: true },
+			),
+		).toThrow(/RPC prompt frame .* protocol v2 reassembly limit of 67108864 bytes/);
 	});
 
 	it("rejects interrupted protocol v2 chunk sequences", () => {

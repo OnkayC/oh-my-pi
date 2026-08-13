@@ -6,14 +6,11 @@ name: Warm bazel disk cache
 # misses every action on a hosted image) — so seed each hosted consumer from
 # the same image it runs on:
 #
-#   warm_darwin (macos-*)  -> scopes `release-darwin-*`, consumed by the
-#                             release_binary darwin jobs. Releases are the
-#                             only other producers for these scopes and a
-#                             release always changes CONFIG_HASH (version
-#                             bump rewrites Cargo.toml/Cargo.lock), so
-#                             without warming here every release rebuilt the
-#                             darwin addons cold (~40-50 min on
-#                             macos-15-intel — run 30357804722).
+#   warm_darwin (macos-14) -> scope `release-darwin-arm64`, consumed by the
+#                             release_binary Darwin job. Releases are the only
+#                             other producer for this scope, and a release
+#                             always changes CONFIG_HASH (version bumps rewrite
+#                             Cargo.toml/Cargo.lock), so warm near HEAD.
 #   warm_bun (ubuntu-22.04)-> the shared `bun-<os>-<lockhash>` store entry.
 #                             PR jobs restore it but never save (per-PR-ref
 #                             copies of the ~500 MB store once ate ~9.4 GB of
@@ -70,7 +67,6 @@ jobs:
          fail-fast: false
          matrix:
             include:
-               - { os: macos-15-intel, target: darwin-x64-baseline, scope: release-darwin-x64 }
                - { os: macos-14, target: darwin-arm64, scope: release-darwin-arm64 }
       runs-on: ${{ matrix.os }}
       steps:
