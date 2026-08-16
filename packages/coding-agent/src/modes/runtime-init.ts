@@ -11,6 +11,7 @@ import { getSessionSlashCommands } from "../extensibility/extensions/get-command
 import type {
 	ExtensionCommandContextActions,
 	ExtensionError,
+	ExtensionMode,
 	ExtensionUIContext,
 } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
@@ -26,6 +27,8 @@ export interface InitializeExtensionsOptions {
 	reportRuntimeError: (error: ExtensionError) => void;
 	/** Optional shutdown hook (rpc mode signals its loop; print mode is a no-op). */
 	onShutdown?: () => void;
+	/** Pi-compatible mode exposed to extension contexts. Defaults to `"print"`. */
+	mode?: ExtensionMode;
 	/** Optional UI context (rpc supplies one; print runs headless). */
 	uiContext?: ExtensionUIContext;
 	/** Optional lifecycle hook for extension-originated messages that can start an agent turn. */
@@ -50,6 +53,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 		reportSendError,
 		reportRuntimeError,
 		onShutdown,
+		mode = "print",
 		uiContext,
 		markAgentInvokingMessage,
 		trackAgentInvokingMessage,
@@ -150,6 +154,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			compact: instructionsOrOptions => runExtensionCompact(session, instructionsOrOptions),
 		},
 		uiContext,
+		mode,
 	);
 
 	runner.onError(reportRuntimeError);

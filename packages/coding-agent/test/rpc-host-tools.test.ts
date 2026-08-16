@@ -311,7 +311,7 @@ function handle(frame) {
 				content: [{ type: "text", text: "working:hello" }],
 			});
 		} finally {
-			client.stop();
+			await client.stop();
 		}
 	});
 });

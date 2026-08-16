@@ -23,6 +23,30 @@ interface JsonlMessageEntry {
 	};
 }
 
+async function createSessionWithArtifacts(root: string): Promise<{
+	cwd: string;
+	sessionDir: string;
+	sourceFile: string;
+	sourceArtifactsDir: string;
+}> {
+	const cwd = path.join(root, "project");
+	const sessionDir = path.join(root, "sessions");
+	const sourceFile = path.join(sessionDir, "source.jsonl");
+	const sourceArtifactsDir = sourceFile.slice(0, -".jsonl".length);
+	const sourceHeader: SessionHeader = {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id: "source-with-artifacts",
+		timestamp: new Date().toISOString(),
+		cwd,
+	};
+	await fs.mkdir(path.join(sourceArtifactsDir, "nested"), { recursive: true });
+	await Bun.write(sourceFile, `${JSON.stringify(sourceHeader)}\n`);
+	await Bun.write(path.join(sourceArtifactsDir, "1.read.log"), "tool output");
+	await Bun.write(path.join(sourceArtifactsDir, "nested", "result.txt"), "nested output");
+	return { cwd, sessionDir, sourceFile, sourceArtifactsDir };
+}
+
 async function appendHostTurn(manager: SessionManager, clientTurnId: string, message: string): Promise<string> {
 	const prepared = await manager.prepareHostTurnOperation({ clientTurnId, kind: "prompt", payload: { message } });
 	const userEntryId = manager.appendMessage({ role: "user", content: message, timestamp: Date.now() });
@@ -119,6 +143,66 @@ describe("SessionManager forks", () => {
 			}
 			setAgentDir(previousAgentDir);
 		}
+	});
+
+	it("copies source artifacts recursively into the fork by default", async () => {
+		using tempDir = TempDir.createSync("@omp-session-fork-artifacts-");
+		const { cwd, sessionDir, sourceFile, sourceArtifactsDir } = await createSessionWithArtifacts(tempDir.path());
+
+		const forked = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
+			suppressBreadcrumb: true,
+		});
+		const forkFile = forked.getSessionFile();
+		if (!forkFile) throw new Error("expected forked session file");
+		const forkArtifactsDir = forkFile.slice(0, -".jsonl".length);
+
+		expect(await Bun.file(path.join(forkArtifactsDir, "1.read.log")).text()).toBe("tool output");
+		expect(await Bun.file(path.join(forkArtifactsDir, "nested", "result.txt")).text()).toBe("nested output");
+		expect(await Bun.file(path.join(sourceArtifactsDir, "1.read.log")).text()).toBe("tool output");
+	});
+
+	it("does not copy artifacts when the caller opts out", async () => {
+		using tempDir = TempDir.createSync("@omp-session-fork-no-artifacts-");
+		const { cwd, sessionDir, sourceFile } = await createSessionWithArtifacts(tempDir.path());
+
+		const forked = await SessionManager.forkFrom(sourceFile, cwd, sessionDir, undefined, {
+			copyArtifacts: false,
+			suppressBreadcrumb: true,
+		});
+		const forkFile = forked.getSessionFile();
+		if (!forkFile) throw new Error("expected forked session file");
+		const forkArtifactsDir = forkFile.slice(0, -".jsonl".length);
+
+		expect(await Bun.file(path.join(forkArtifactsDir, "1.read.log")).exists()).toBe(false);
+	});
+
+	it("does not treat an extensionless source's parent directory as artifacts", async () => {
+		using tempDir = TempDir.createSync("@omp-session-fork-extensionless-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const forkDir = path.join(tempDir.path(), "forks");
+		const sourceFile = path.join(sessionDir, "source");
+		const unrelatedFile = path.join(sessionDir, "unrelated.txt");
+		const sourceHeader: SessionHeader = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: "extensionless-source",
+			timestamp: new Date().toISOString(),
+			cwd,
+		};
+		await fs.mkdir(sessionDir, { recursive: true });
+		await Bun.write(sourceFile, `${JSON.stringify(sourceHeader)}\n`);
+		await Bun.write(unrelatedFile, "must not be copied");
+
+		const forked = await SessionManager.forkFrom(sourceFile, cwd, forkDir, undefined, {
+			suppressBreadcrumb: true,
+		});
+		const forkFile = forked.getSessionFile();
+		if (!forkFile) throw new Error("expected forked session file");
+		const forkArtifactsDir = forkFile.slice(0, -".jsonl".length);
+
+		expect(await Bun.file(path.join(forkArtifactsDir, "unrelated.txt")).exists()).toBe(false);
+		expect(await Bun.file(unrelatedFile).text()).toBe("must not be copied");
 	});
 
 	it("keeps copied branch host-turn history self-contained during rollback", async () => {
