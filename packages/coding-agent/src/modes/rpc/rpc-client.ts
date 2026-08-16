@@ -7,12 +7,19 @@
 import { isPromise } from "node:util/types";
 import type { AgentEvent, AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import type { Effort, ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
-import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
+import {
+	MAX_RPC_FRAME_BYTES,
+	MAX_RPC_REASSEMBLED_BYTES,
+	RpcFrameDecoder,
+	RpcFrameEncoder,
+	RpcFrameTooLargeError,
+	type RpcProtocolVersion,
+} from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
 	RPC_MESSAGES_PAGE_STALE_ERROR,
@@ -20,10 +27,19 @@ import {
 	type RpcMessagesPageOptions,
 } from "./rpc-messages";
 import type {
+	HostTurnBoundary,
+	RpcApprovalDecision,
+	RpcApprovalRequestFrame,
+	RpcApprovalResolvedFrame,
+	RpcApprovalResponseFrame,
+	RpcAskResponseFrame,
+	RpcAuthStatus,
 	RpcAvailableCommandsUpdateFrame,
+	RpcAvailableSkill,
 	RpcAvailableSlashCommand,
 	RpcCommand,
 	RpcExtensionUIRequest,
+	RpcExtensionUIResolvedFrame,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
 	RpcHostToolCallRequest,
@@ -31,7 +47,17 @@ import type {
 	RpcHostToolDefinition,
 	RpcHostToolResult,
 	RpcHostToolUpdate,
+	RpcHostTurnOptions,
+	RpcPlanModeChangedFrame,
+	RpcPlanModeState,
+	RpcPlanReviewDecision,
+	RpcPlanReviewRequestFrame,
+	RpcPlanReviewResolution,
+	RpcPlanReviewResolvedFrame,
+	RpcPlanWorkflow,
 	RpcResponse,
+	RpcSemanticCapabilities,
+	RpcSemanticCapabilityKey,
 	RpcSessionState,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
@@ -66,9 +92,24 @@ export interface RpcClientOptions {
 	terminationGraceMs?: number;
 	/** Custom tools owned by the embedding host and exposed over the RPC transport */
 	customTools?: RpcClientCustomTool[];
+	/** Semantic capability revisions to select; defaults to this client's supported revision capped by the offer. */
+	capabilities?: RpcSemanticCapabilities | false;
 }
 
-export type ModelInfo = Pick<Model, "provider" | "id" | "contextWindow" | "reasoning" | "thinking">;
+export interface RpcFollowUpOptions {
+	images?: ImageContent[];
+	clientTurnId: string;
+	optionFingerprint: string;
+	turnOptions?: RpcHostTurnOptions;
+}
+
+export type ModelInfo = Pick<
+	Model,
+	"provider" | "id" | "name" | "contextWindow" | "input" | "reasoning" | "thinking"
+> & {
+	thinkingEfforts?: Effort[];
+	fastModeSupported?: boolean;
+};
 
 export type RpcEventListener = (event: AgentEvent) => void;
 export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
@@ -76,6 +117,19 @@ export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
+export type RpcApprovalRequestListener = (request: RpcApprovalRequestFrame) => void;
+export type RpcApprovalResolvedListener = (resolution: RpcApprovalResolvedFrame) => void;
+export type RpcExtensionUIRequestListener = (request: RpcExtensionUIRequest) => void;
+export type RpcExtensionUIResolvedListener = (resolution: RpcExtensionUIResolvedFrame) => void;
+export type RpcPlanModeChangedListener = (state: RpcPlanModeChangedFrame) => void;
+export type RpcPlanReviewRequestListener = (request: RpcPlanReviewRequestFrame) => void;
+export type RpcPlanReviewResolvedListener = (resolution: RpcPlanReviewResolvedFrame) => void;
+export type RpcUnknownNotificationListener = (frame: Record<string, unknown>) => void;
+
+export type RpcExtensionUIResponsePayload =
+	| { value: string }
+	| { confirmed: boolean }
+	| { cancelled: true; timedOut?: boolean };
 
 export interface RpcClientToolContext<TDetails = unknown> {
 	toolCallId: string;
@@ -132,6 +186,9 @@ const sessionEventTypes = new Set<AgentSessionEvent["type"]>([
 	"thinking_level_changed",
 	"model_changed",
 	"goal_updated",
+	"follow_up_queued",
+	"host_turn_promoted",
+	"host_turn_cancelled",
 ]);
 
 function isRpcResponse(value: unknown): value is RpcResponse {
@@ -154,6 +211,55 @@ function supportsRpcProtocolV2(value: Record<string, unknown>): boolean {
 		value.maxFrameBytes === MAX_RPC_FRAME_BYTES &&
 		value.maxReassembledFrameBytes === MAX_RPC_REASSEMBLED_BYTES
 	);
+}
+
+const RPC_SEMANTIC_CAPABILITY_KEYS = [
+	"structuredApprovals",
+	"runtimePolicy",
+	"authStatus",
+	"richUserInput",
+	"planControl",
+	"planReview",
+	"hostTurns",
+	"modelCatalog",
+	"slashCommands",
+	"skills",
+	"tasks",
+	"subagents",
+] as const satisfies readonly RpcSemanticCapabilityKey[];
+
+const RPC_CLIENT_CAPABILITY_REVISIONS = {
+	structuredApprovals: 1,
+	runtimePolicy: 1,
+	authStatus: 1,
+	richUserInput: 1,
+	planControl: 1,
+	planReview: 1,
+	hostTurns: 1,
+	modelCatalog: 1,
+	slashCommands: 1,
+	skills: 1,
+	tasks: 1,
+	subagents: 1,
+} as const satisfies Record<RpcSemanticCapabilityKey, number>;
+
+function normalizeSemanticCapabilities(value: unknown): RpcSemanticCapabilities {
+	if (!isRecord(value)) return {};
+	const normalized: RpcSemanticCapabilities = {};
+	for (const key of RPC_SEMANTIC_CAPABILITY_KEYS) {
+		const revision = value[key];
+		if (Number.isSafeInteger(revision) && (revision as number) > 0) normalized[key] = revision as number;
+	}
+	return normalized;
+}
+
+function capSupportedCapabilities(value: unknown): RpcSemanticCapabilities {
+	const requested = normalizeSemanticCapabilities(value);
+	for (const key of RPC_SEMANTIC_CAPABILITY_KEYS) {
+		const revision = requested[key];
+		if (revision !== undefined) requested[key] = Math.min(revision, RPC_CLIENT_CAPABILITY_REVISIONS[key]);
+	}
+	return requested;
 }
 
 function isAgentEvent(value: unknown): value is AgentEvent {
@@ -207,8 +313,168 @@ function isRpcHostToolCancelRequest(value: unknown): value is RpcHostToolCancelR
 }
 
 function isRpcExtensionUiRequest(value: unknown): value is RpcExtensionUIRequest {
-	if (!isRecord(value)) return false;
-	return value.type === "extension_ui_request" && typeof value.id === "string" && typeof value.method === "string";
+	if (!isRecord(value) || value.type !== "extension_ui_request" || typeof value.id !== "string") return false;
+	const optionalTimeoutValid = value.timeout === undefined || typeof value.timeout === "number";
+	switch (value.method) {
+		case "ask":
+			return Array.isArray(value.questions) && optionalTimeoutValid;
+		case "select":
+			return (
+				typeof value.title === "string" &&
+				Array.isArray(value.options) &&
+				value.options.every(option => typeof option === "string") &&
+				optionalTimeoutValid
+			);
+		case "confirm":
+			return typeof value.title === "string" && typeof value.message === "string" && optionalTimeoutValid;
+		case "input":
+			return (
+				typeof value.title === "string" &&
+				(value.placeholder === undefined || typeof value.placeholder === "string") &&
+				optionalTimeoutValid
+			);
+		case "editor":
+			return (
+				typeof value.title === "string" &&
+				(value.prefill === undefined || typeof value.prefill === "string") &&
+				(value.promptStyle === undefined || typeof value.promptStyle === "boolean")
+			);
+		case "cancel":
+			return typeof value.targetId === "string";
+		case "notify":
+			return (
+				typeof value.message === "string" &&
+				(value.notifyType === undefined ||
+					value.notifyType === "info" ||
+					value.notifyType === "warning" ||
+					value.notifyType === "error")
+			);
+		case "setStatus":
+			return (
+				typeof value.statusKey === "string" &&
+				(value.statusText === undefined || typeof value.statusText === "string")
+			);
+		case "setWidget":
+			return (
+				typeof value.widgetKey === "string" &&
+				(value.widgetLines === undefined ||
+					(Array.isArray(value.widgetLines) && value.widgetLines.every(line => typeof line === "string"))) &&
+				(value.widgetPlacement === undefined ||
+					value.widgetPlacement === "aboveEditor" ||
+					value.widgetPlacement === "belowEditor")
+			);
+		case "setTitle":
+			return typeof value.title === "string";
+		case "set_editor_text":
+			return typeof value.text === "string";
+		case "open_url":
+			return (
+				typeof value.url === "string" &&
+				(value.launchUrl === undefined || typeof value.launchUrl === "string") &&
+				(value.instructions === undefined || typeof value.instructions === "string")
+			);
+		default:
+			return false;
+	}
+}
+
+function rpcExtensionUiRequiresResponse(request: RpcExtensionUIRequest): boolean {
+	return (
+		request.method === "ask" ||
+		request.method === "select" ||
+		request.method === "confirm" ||
+		request.method === "input" ||
+		request.method === "editor"
+	);
+}
+
+function isRpcApprovalDecision(value: unknown): value is RpcApprovalDecision {
+	return value === "approve_once" || value === "approve_session" || value === "deny" || value === "cancel";
+}
+
+function isRpcApprovalRequestFrame(value: unknown): value is RpcApprovalRequestFrame {
+	if (!isRecord(value) || value.type !== "approval_request") return false;
+	return (
+		typeof value.id === "string" &&
+		typeof value.sessionId === "string" &&
+		typeof value.toolCallId === "string" &&
+		typeof value.toolName === "string" &&
+		(value.approvalMode === "always-ask" || value.approvalMode === "write" || value.approvalMode === "yolo") &&
+		(value.tier === "read" || value.tier === "write" || value.tier === "exec") &&
+		"arguments" in value &&
+		(value.reason === undefined || typeof value.reason === "string") &&
+		Array.isArray(value.details) &&
+		value.details.every(detail => typeof detail === "string") &&
+		Array.isArray(value.providerSafetyChecks) &&
+		value.providerSafetyChecks.every(check => typeof check === "string") &&
+		Array.isArray(value.allowedDecisions) &&
+		value.allowedDecisions.every(isRpcApprovalDecision)
+	);
+}
+
+function isRpcApprovalResolvedFrame(value: unknown): value is RpcApprovalResolvedFrame {
+	if (!isRecord(value) || value.type !== "approval_resolved" || typeof value.id !== "string") return false;
+	const validOutcome =
+		value.outcome === "accepted" ||
+		value.outcome === "denied" ||
+		value.outcome === "cancelled" ||
+		value.outcome === "timed_out" ||
+		value.outcome === "stale" ||
+		value.outcome === "aborted";
+	return validOutcome && (value.decision === undefined || isRpcApprovalDecision(value.decision));
+}
+
+function isRpcExtensionUIResolvedFrame(value: unknown): value is RpcExtensionUIResolvedFrame {
+	if (!isRecord(value) || value.type !== "extension_ui_resolved") return false;
+	return (
+		typeof value.id === "string" &&
+		value.method === "ask" &&
+		(value.outcome === "submitted" ||
+			value.outcome === "chat" ||
+			value.outcome === "cancelled" ||
+			value.outcome === "timed_out" ||
+			value.outcome === "stale" ||
+			value.outcome === "aborted")
+	);
+}
+
+function isRpcPlanModeChangedFrame(value: unknown): value is RpcPlanModeChangedFrame {
+	return (
+		isRecord(value) &&
+		value.type === "plan_mode_changed" &&
+		(value.status === "off" || value.status === "active" || value.status === "paused") &&
+		(value.workflow === undefined || value.workflow === "parallel" || value.workflow === "iterative") &&
+		typeof value.reentry === "boolean"
+	);
+}
+
+function isRpcPlanReviewRequestFrame(value: unknown): value is RpcPlanReviewRequestFrame {
+	return (
+		isRecord(value) &&
+		value.type === "plan_review_request" &&
+		typeof value.id === "string" &&
+		typeof value.title === "string" &&
+		typeof value.path === "string" &&
+		typeof value.markdown === "string" &&
+		typeof value.planDigest === "string" &&
+		Array.isArray(value.allowedContextStrategies) &&
+		Array.isArray(value.executionModels) &&
+		(value.workflow === "parallel" || value.workflow === "iterative")
+	);
+}
+
+function isRpcPlanReviewResolvedFrame(value: unknown): value is RpcPlanReviewResolvedFrame {
+	return (
+		isRecord(value) &&
+		value.type === "plan_review_resolved" &&
+		typeof value.id === "string" &&
+		(value.outcome === "executing" ||
+			value.outcome === "refining" ||
+			value.outcome === "cancelled" ||
+			value.outcome === "stale" ||
+			value.outcome === "aborted" ||
+			value.outcome === "process_exited")
+	);
 }
 
 function normalizeToolResult<TDetails>(result: RpcClientToolResult<TDetails>): AgentToolResult<TDetails> {
@@ -253,17 +519,55 @@ export class RpcClient {
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
+	#approvalRequestListeners = new Set<RpcApprovalRequestListener>();
+	#approvalResolvedListeners = new Set<RpcApprovalResolvedListener>();
+	#pendingApprovalRequests = new Map<string, RpcApprovalRequestFrame>();
+	#pendingExtensionUiRequests = new Map<string, RpcExtensionUIRequest>();
+	#pendingExtensionUiTimeouts = new Map<string, NodeJS.Timeout>();
+	#extensionUiResolvedListeners = new Set<RpcExtensionUIResolvedListener>();
+	#planModeChangedListeners = new Set<RpcPlanModeChangedListener>();
+	#planReviewRequestListeners = new Set<RpcPlanReviewRequestListener>();
+	#planReviewResolvedListeners = new Set<RpcPlanReviewResolvedListener>();
+	#pendingPlanReviewRequests = new Map<string, RpcPlanReviewRequestFrame>();
+	#unknownNotificationListeners = new Set<RpcUnknownNotificationListener>();
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
 	#pendingHostToolCalls = new Map<string, { controller: AbortController }>();
 	#requestId = 0;
 	#protocolVersion: RpcProtocolVersion = 1;
-	#extensionUiListeners: Set<(req: RpcExtensionUIRequest) => void> = new Set();
+	#frameEncoder = new RpcFrameEncoder();
+	#offeredCapabilities: RpcSemanticCapabilities = {};
+	#selectedCapabilities: RpcSemanticCapabilities = {};
+	#extensionUiListeners = new Set<RpcExtensionUIRequestListener>();
 	#abortController = new AbortController();
 
 	constructor(private options: RpcClientOptions = {}) {
 		this.#customTools = [...(options.customTools ?? [])];
+	}
+
+	#clearPendingExtensionUiRequests(): void {
+		for (const timeout of this.#pendingExtensionUiTimeouts.values()) clearTimeout(timeout);
+		this.#pendingExtensionUiTimeouts.clear();
+		this.#pendingExtensionUiRequests.clear();
+	}
+
+	#forgetPendingExtensionUiRequest(requestId: string): void {
+		this.#pendingExtensionUiRequests.delete(requestId);
+		const timeout = this.#pendingExtensionUiTimeouts.get(requestId);
+		clearTimeout(timeout);
+		this.#pendingExtensionUiTimeouts.delete(requestId);
+	}
+
+	#rememberPendingExtensionUiRequest(request: RpcExtensionUIRequest): void {
+		this.#forgetPendingExtensionUiRequest(request.id);
+		this.#pendingExtensionUiRequests.set(request.id, request);
+		if (!("timeout" in request) || request.timeout === undefined) return;
+		const timeout = this.#startTimeout(request.timeout, () => {
+			this.#pendingExtensionUiRequests.delete(request.id);
+			this.#pendingExtensionUiTimeouts.delete(request.id);
+		});
+		this.#pendingExtensionUiTimeouts.set(request.id, timeout);
 	}
 
 	/**
@@ -284,6 +588,12 @@ export class RpcClient {
 		// short-circuit the new stdout reader (issue #4079).
 		this.#abortController = new AbortController();
 		this.#protocolVersion = 1;
+		this.#frameEncoder = new RpcFrameEncoder();
+		this.#offeredCapabilities = {};
+		this.#selectedCapabilities = {};
+		this.#pendingPlanReviewRequests.clear();
+		this.#pendingApprovalRequests.clear();
+		this.#clearPendingExtensionUiRequests();
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -312,6 +622,7 @@ export class RpcClient {
 		const { promise: readyPromise, resolve: readyResolve, reject: readyReject } = Promise.withResolvers<void>();
 		let readySettled = false;
 		let protocolV2Supported = false;
+		let offeredCapabilities: RpcSemanticCapabilities = {};
 		let protocolV2Enabled = false;
 		const frameDecoder = new RpcFrameDecoder();
 
@@ -324,6 +635,9 @@ export class RpcClient {
 			this.#pendingRequests.clear();
 			for (const pendingCall of this.#pendingHostToolCalls.values()) pendingCall.controller.abort(error);
 			this.#pendingHostToolCalls.clear();
+			this.#pendingPlanReviewRequests.clear();
+			this.#pendingApprovalRequests.clear();
+			this.#clearPendingExtensionUiRequests();
 
 			try {
 				child.kill(undefined, this.options.terminationGraceMs);
@@ -340,6 +654,7 @@ export class RpcClient {
 			for await (const line of lines) {
 				if (!readySettled && isRecord(line) && line.type === "ready") {
 					protocolV2Supported = supportsRpcProtocolV2(line);
+					offeredCapabilities = normalizeSemanticCapabilities(line.capabilities);
 					readySettled = true;
 					readyResolve();
 					continue;
@@ -426,9 +741,30 @@ export class RpcClient {
 				)
 					throw new Error("RPC protocol v2 negotiation failed");
 				this.#protocolVersion = 2;
+				this.#frameEncoder.setProtocolVersion(2);
 			}
+			// A selected hostTurns capability may replay a prepared durable turn immediately.
+			// Install the configured host-owned tool surface first so recovery cannot run
+			// against a transient, incomplete startup configuration.
 			if (this.#customTools.length > 0) {
 				await this.setCustomTools(this.#customTools);
+			}
+			this.#offeredCapabilities = offeredCapabilities;
+			if (this.options.capabilities !== false && Object.keys(offeredCapabilities).length > 0) {
+				const configured = capSupportedCapabilities(this.options.capabilities ?? offeredCapabilities);
+				const requested: RpcSemanticCapabilities = {};
+				for (const key of RPC_SEMANTIC_CAPABILITY_KEYS) {
+					const revision = configured[key];
+					const offeredRevision = offeredCapabilities[key];
+					if (revision !== undefined && offeredRevision !== undefined) {
+						requested[key] = Math.min(revision, offeredRevision);
+					}
+				}
+				const response = await this.#send({ type: "negotiate_capabilities", capabilities: requested });
+				if (!response.success || response.command !== "negotiate_capabilities" || !isRecord(response.data)) {
+					throw new Error("RPC semantic capability negotiation failed");
+				}
+				this.#selectedCapabilities = normalizeSemanticCapabilities(response.data.capabilities);
 			}
 		} catch (cause) {
 			// Startup failed after spawning the child. Reap it before returning
@@ -439,6 +775,14 @@ export class RpcClient {
 		} finally {
 			clearTimeout(readyTimeout);
 		}
+	}
+
+	get offeredCapabilities(): RpcSemanticCapabilities {
+		return { ...this.#offeredCapabilities };
+	}
+
+	get selectedCapabilities(): RpcSemanticCapabilities {
+		return { ...this.#selectedCapabilities };
 	}
 
 	/**
@@ -458,6 +802,9 @@ export class RpcClient {
 			pendingCall.controller.abort(error);
 		}
 		this.#pendingHostToolCalls.clear();
+		this.#pendingPlanReviewRequests.clear();
+		this.#pendingApprovalRequests.clear();
+		this.#clearPendingExtensionUiRequests();
 		return this.#waitForExit(child);
 	}
 
@@ -538,6 +885,116 @@ export class RpcClient {
 		return () => this.#availableCommandsUpdateListeners.delete(listener);
 	}
 
+	/** Subscribe to extension UI requests, including negotiated rich ask requests. */
+	onExtensionUIRequest(listener: RpcExtensionUIRequestListener): () => void {
+		this.#extensionUiListeners.add(listener);
+		for (const request of this.#pendingExtensionUiRequests.values()) listener(request);
+		return () => this.#extensionUiListeners.delete(listener);
+	}
+
+	/** Subscribe to negotiated structured approval requests. */
+	onApprovalRequest(listener: RpcApprovalRequestListener): () => void {
+		this.#approvalRequestListeners.add(listener);
+		for (const request of this.#pendingApprovalRequests.values()) listener(request);
+		return () => this.#approvalRequestListeners.delete(listener);
+	}
+
+	/** Subscribe to authoritative structured approval resolutions. */
+	onApprovalResolved(listener: RpcApprovalResolvedListener): () => void {
+		this.#approvalResolvedListeners.add(listener);
+		return () => this.#approvalResolvedListeners.delete(listener);
+	}
+
+	/** Subscribe to authoritative rich ask resolutions. */
+	onExtensionUIResolved(listener: RpcExtensionUIResolvedListener): () => void {
+		this.#extensionUiResolvedListeners.add(listener);
+		return () => this.#extensionUiResolvedListeners.delete(listener);
+	}
+
+	/** Subscribe to committed native plan-mode transitions. */
+	onPlanModeChanged(listener: RpcPlanModeChangedListener): () => void {
+		this.#planModeChangedListeners.add(listener);
+		return () => this.#planModeChangedListeners.delete(listener);
+	}
+
+	/** Subscribe to durable native plan reviews. */
+	onPlanReviewRequest(listener: RpcPlanReviewRequestListener): () => void {
+		this.#planReviewRequestListeners.add(listener);
+		for (const request of this.#pendingPlanReviewRequests.values()) listener(request);
+		return () => this.#planReviewRequestListeners.delete(listener);
+	}
+
+	/** Subscribe to authoritative native plan-review resolution. */
+	onPlanReviewResolved(listener: RpcPlanReviewResolvedListener): () => void {
+		this.#planReviewResolvedListeners.add(listener);
+		return () => this.#planReviewResolvedListeners.delete(listener);
+	}
+
+	/** Respond to a select, confirm, input, or editor request without semantic capability negotiation. */
+	respondToExtensionUI(requestId: string, response: RpcExtensionUIResponsePayload): void {
+		if ("value" in response) {
+			try {
+				this.#writeFrame({ type: "extension_ui_response", id: requestId, value: response.value });
+			} catch (error) {
+				if (!(error instanceof RpcFrameTooLargeError)) throw error;
+				this.#writeFrame({ type: "extension_ui_response", id: requestId, cancelled: true });
+				this.#forgetPendingExtensionUiRequest(requestId);
+				throw error;
+			}
+			this.#forgetPendingExtensionUiRequest(requestId);
+			return;
+		}
+		if ("confirmed" in response) {
+			this.#writeFrame({ type: "extension_ui_response", id: requestId, confirmed: response.confirmed });
+			this.#forgetPendingExtensionUiRequest(requestId);
+			return;
+		}
+		this.#writeFrame({
+			type: "extension_ui_response",
+			id: requestId,
+			cancelled: true,
+			...(response.timedOut ? { timedOut: true } : {}),
+		});
+		this.#forgetPendingExtensionUiRequest(requestId);
+	}
+
+	/** Send one exact decision for a negotiated structured approval request. */
+	respondToApproval(requestId: string, decision: RpcApprovalDecision): void {
+		this.#requireCapability("structuredApprovals");
+		this.#writeFrame({ type: "approval_response", id: requestId, decision } satisfies RpcApprovalResponseFrame);
+		this.#pendingApprovalRequests.delete(requestId);
+	}
+
+	/** Submit, redirect, cancel, or time out a negotiated rich ask request. */
+	respondToAsk(requestId: string, response: DistributiveOmit<RpcAskResponseFrame, "type" | "id">): void {
+		this.#requireCapability("richUserInput");
+		if ("result" in response) {
+			try {
+				this.#writeFrame({ type: "extension_ui_response", id: requestId, result: response.result });
+			} catch (error) {
+				if (!(error instanceof RpcFrameTooLargeError)) throw error;
+				this.#writeFrame({ type: "extension_ui_response", id: requestId, cancelled: true });
+				this.#forgetPendingExtensionUiRequest(requestId);
+				throw error;
+			}
+			this.#forgetPendingExtensionUiRequest(requestId);
+			return;
+		}
+		this.#writeFrame({
+			type: "extension_ui_response",
+			id: requestId,
+			cancelled: true,
+			...(response.timedOut ? { timedOut: true } : {}),
+		});
+		this.#forgetPendingExtensionUiRequest(requestId);
+	}
+
+	/** Observe additive notification frames unknown to this client version. */
+	onUnknownNotification(listener: RpcUnknownNotificationListener): () => void {
+		this.#unknownNotificationListeners.add(listener);
+		return () => this.#unknownNotificationListeners.delete(listener);
+	}
+
 	/**
 	 * Get collected stderr output (useful for debugging).
 	 */
@@ -560,8 +1017,9 @@ export class RpcClient {
 	 * Returns immediately after sending; use onEvent() to receive streaming events.
 	 * Use waitForIdle() to wait for completion.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "prompt", message, images });
+	async prompt(message: string, images?: ImageContent[], clientTurnId?: string): Promise<void> {
+		if (clientTurnId !== undefined) this.#requireCapability("hostTurns");
+		this.#getData(await this.#send({ type: "prompt", message, images, clientTurnId }));
 	}
 
 	/**
@@ -574,8 +1032,25 @@ export class RpcClient {
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.#send({ type: "follow_up", message, images });
+	followUp(message: string, images?: ImageContent[]): Promise<void>;
+	followUp(message: string, options: RpcFollowUpOptions): Promise<void>;
+	async followUp(message: string, imagesOrOptions?: ImageContent[] | RpcFollowUpOptions): Promise<void> {
+		if (Array.isArray(imagesOrOptions) || imagesOrOptions === undefined) {
+			this.#getData(await this.#send({ type: "follow_up", message, images: imagesOrOptions }));
+			return;
+		}
+		this.#requireCapability("hostTurns");
+
+		this.#getData(
+			await this.#send({
+				type: "follow_up",
+				message,
+				images: imagesOrOptions.images,
+				clientTurnId: imagesOrOptions.clientTurnId,
+				optionFingerprint: imagesOrOptions.optionFingerprint,
+				turnOptions: imagesOrOptions.turnOptions,
+			}),
+		);
 	}
 
 	/**
@@ -617,6 +1092,48 @@ export class RpcClient {
 					? state.tokensPerSecond
 					: null,
 		};
+	}
+
+	/** Commit a native active, paused, or off plan-mode transition. */
+	async setPlanMode(input: {
+		status: RpcPlanModeState["status"];
+		workflow?: RpcPlanWorkflow;
+		planFilePath?: string;
+	}): Promise<RpcPlanModeState> {
+		this.#requireCapability("planControl");
+		const response = await this.#send({ type: "set_plan_mode", ...input });
+		return this.#getData(response);
+	}
+
+	/** Respond idempotently to a durable same-session plan review. */
+	async respondToPlanReview(requestId: string, decision: RpcPlanReviewDecision): Promise<RpcPlanReviewResolution> {
+		this.#requireCapability("planReview");
+		const response = await this.#send({ type: "respond_to_plan_review", requestId, decision });
+		return this.#getData(response);
+	}
+
+	/** Return chronological durable host-owned turn boundaries. */
+	async getTurns(): Promise<HostTurnBoundary[]> {
+		this.#requireCapability("hostTurns");
+		const response = await this.#send({ type: "get_turns" });
+		return this.#getData<{ turns: HostTurnBoundary[] }>(response).turns;
+	}
+
+	/** Atomically roll back the exact durable host-turn suffix. */
+	async rollbackTurns(
+		count: number,
+		expectedClientTurnIds: string[],
+	): Promise<{ removedClientTurnIds: string[]; turns: HostTurnBoundary[]; sessionId: string; sessionFile?: string }> {
+		this.#requireCapability("hostTurns");
+		const response = await this.#send({ type: "rollback_turns", count, expectedClientTurnIds });
+		return this.#getData(response);
+	}
+
+	/** Cancel one prepared durable follow-up still waiting in the queue. */
+	async cancelFollowUp(clientTurnId: string): Promise<{ cancelled: boolean }> {
+		this.#requireCapability("hostTurns");
+		const response = await this.#send({ type: "cancel_follow_up", clientTurnId });
+		return this.#getData(response);
 	}
 
 	/**
@@ -695,6 +1212,29 @@ export class RpcClient {
 	async getAvailableCommands(): Promise<RpcAvailableSlashCommand[]> {
 		const response = await this.#send({ type: "get_available_commands" });
 		return this.#getData<{ commands: RpcAvailableSlashCommand[] }>(response).commands;
+	}
+
+	/** Apply the negotiated session-scoped tool approval policy. */
+	async setRuntimePolicy(
+		approvalMode: "always-ask" | "write" | "yolo",
+	): Promise<{ approvalMode: "always-ask" | "write" | "yolo" }> {
+		this.#requireCapability("runtimePolicy");
+		const response = await this.#send({ type: "set_runtime_policy", approvalMode });
+		return this.#getData(response);
+	}
+
+	/** Return redacted configured-provider and account authentication status. */
+	async getAuthStatus(): Promise<RpcAuthStatus> {
+		this.#requireCapability("authStatus");
+		const response = await this.#send({ type: "get_auth_status" });
+		return this.#getData(response);
+	}
+
+	/** Return the skills exposed by the configured OMP instance. */
+	async getAvailableSkills(): Promise<RpcAvailableSkill[]> {
+		this.#requireCapability("skills");
+		const response = await this.#send({ type: "get_available_skills" });
+		return this.#getData<{ skills: RpcAvailableSkill[] }>(response).skills;
 	}
 
 	/**
@@ -989,6 +1529,10 @@ export class RpcClient {
 	 * Collect events until agent becomes idle.
 	 */
 	collectEvents(timeout = 60000): Promise<AgentEvent[]> {
+		return this.#startEventCollection(timeout).promise;
+	}
+
+	#startEventCollection(timeout: number): { promise: Promise<AgentEvent[]>; cancel: () => void } {
 		const { promise, resolve, reject } = Promise.withResolvers<AgentEvent[]>();
 		const events: AgentEvent[] = [];
 		let settled = false;
@@ -1008,16 +1552,30 @@ export class RpcClient {
 			unsubscribe();
 			reject(new Error(`Timeout collecting events. Stderr: ${this.#process?.peekStderr() ?? ""}`));
 		});
-		return promise;
+		return {
+			promise,
+			cancel: () => {
+				if (settled) return;
+				settled = true;
+				unsubscribe();
+				clearTimeout(timeoutId);
+				resolve(events);
+			},
+		};
 	}
 
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<AgentEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		const collection = this.#startEventCollection(timeout);
+		try {
+			await this.prompt(message, images);
+		} catch (error) {
+			collection.cancel();
+			throw error;
+		}
+		return collection.promise;
 	}
 
 	// =========================================================================
@@ -1041,10 +1599,48 @@ export class RpcClient {
 			return;
 		}
 
+		if (isRpcApprovalRequestFrame(data)) {
+			this.#pendingApprovalRequests.set(data.id, data);
+			for (const listener of this.#approvalRequestListeners) listener(data);
+			return;
+		}
+
+		if (isRpcApprovalResolvedFrame(data)) {
+			this.#pendingApprovalRequests.delete(data.id);
+			for (const listener of this.#approvalResolvedListeners) listener(data);
+			return;
+		}
+
+		if (isRpcExtensionUIResolvedFrame(data)) {
+			this.#forgetPendingExtensionUiRequest(data.id);
+			for (const listener of this.#extensionUiResolvedListeners) listener(data);
+			return;
+		}
+
+		if (isRpcPlanModeChangedFrame(data)) {
+			for (const listener of this.#planModeChangedListeners) listener(data);
+			return;
+		}
+
+		if (isRpcPlanReviewRequestFrame(data)) {
+			this.#pendingPlanReviewRequests.set(data.id, data);
+			for (const listener of this.#planReviewRequestListeners) listener(data);
+			return;
+		}
+
+		if (isRpcPlanReviewResolvedFrame(data)) {
+			this.#pendingPlanReviewRequests.delete(data.id);
+			for (const listener of this.#planReviewResolvedListeners) listener(data);
+			return;
+		}
+
 		if (isRpcExtensionUiRequest(data)) {
-			for (const listener of this.#extensionUiListeners) {
-				listener(data);
+			if (data.method === "cancel") {
+				this.#forgetPendingExtensionUiRequest(data.targetId);
+			} else if (rpcExtensionUiRequiresResponse(data)) {
+				this.#rememberPendingExtensionUiRequest(data);
 			}
+			for (const listener of this.#extensionUiListeners) listener(data);
 			return;
 		}
 
@@ -1081,16 +1677,22 @@ export class RpcClient {
 			return;
 		}
 
-		if (!isAgentSessionEvent(data)) return;
-
-		for (const listener of this.#sessionEventListeners) {
-			listener(data);
+		if (isAgentSessionEvent(data)) {
+			for (const listener of this.#sessionEventListeners) listener(data);
+			if (isAgentEvent(data)) {
+				for (const listener of this.#eventListeners) listener(data);
+			}
+			return;
 		}
 
-		if (!isAgentEvent(data)) return;
+		if (isRecord(data) && typeof data.type === "string" && !isRpcResponse(data)) {
+			for (const listener of this.#unknownNotificationListeners) listener(data);
+		}
+	}
 
-		for (const listener of this.#eventListeners) {
-			listener(data);
+	#requireCapability(key: RpcSemanticCapabilityKey, minimumRevision = 1): void {
+		if ((this.#selectedCapabilities[key] ?? 0) < minimumRevision) {
+			throw new Error(`RPC semantic capability ${key}@${minimumRevision} was not selected`);
 		}
 	}
 
@@ -1103,11 +1705,16 @@ export class RpcClient {
 		const fullCommand = { ...command, id } as RpcCommand;
 		const { promise, resolve, reject } = Promise.withResolvers<RpcResponse>();
 		let settled = false;
-		const timeoutId = this.#startTimeout(timeoutMs, () => {
-			if (settled) return;
+		let timeoutId: NodeJS.Timeout | undefined;
+		const rejectRequest = (error: Error): void => {
 			this.#pendingRequests.delete(id);
+			if (settled) return;
 			settled = true;
-			reject(
+			clearTimeout(timeoutId);
+			reject(error);
+		};
+		timeoutId = this.#startTimeout(timeoutMs, () => {
+			rejectRequest(
 				new Error(`Timeout waiting for response to ${command.type}. Stderr: ${this.#process?.peekStderr() ?? ""}`),
 			);
 		});
@@ -1119,21 +1726,14 @@ export class RpcClient {
 				clearTimeout(timeoutId);
 				resolve(response);
 			},
-			reject: error => {
-				if (settled) return;
-				settled = true;
-				clearTimeout(timeoutId);
-				reject(error);
-			},
+			reject: rejectRequest,
 		});
 
-		this.#writeFrame(fullCommand, err => {
-			this.#pendingRequests.delete(id);
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeoutId);
-			reject(err);
-		});
+		try {
+			this.#writeFrame(fullCommand, rejectRequest);
+		} catch (cause) {
+			rejectRequest(cause instanceof Error ? cause : new Error(String(cause)));
+		}
 		return promise;
 	}
 
@@ -1178,35 +1778,51 @@ export class RpcClient {
 			} satisfies RpcHostToolResult);
 		} catch (error) {
 			if (controller.signal.aborted) return;
-			this.#writeFrame({
-				type: "host_tool_result",
-				id: request.id,
-				result: {
-					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-					details: {},
-				},
-				isError: true,
-			} satisfies RpcHostToolResult);
+			try {
+				this.#writeFrame({
+					type: "host_tool_result",
+					id: request.id,
+					result: {
+						content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+						details: {},
+					},
+					isError: true,
+				} satisfies RpcHostToolResult);
+			} catch (writeError) {
+				if (!(writeError instanceof RpcFrameTooLargeError)) throw writeError;
+				this.#writeFrame({
+					type: "host_tool_result",
+					id: request.id,
+					result: {
+						content: [{ type: "text", text: "Host tool failed with an oversized error message" }],
+						details: {},
+					},
+					isError: true,
+				} satisfies RpcHostToolResult);
+			}
 		} finally {
 			this.#pendingHostToolCalls.delete(request.id);
 		}
 	}
 
 	#writeFrame(
-		frame: RpcCommand | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
+		frame: RpcCommand | RpcApprovalResponseFrame | RpcExtensionUIResponse | RpcHostToolResult | RpcHostToolUpdate,
 		onError?: (error: Error) => void,
 	): void {
 		if (!this.#process?.stdin) {
 			throw new Error("Client not started");
 		}
 		const stdin = this.#process.stdin as FileSink;
-		stdin.write(`${JSON.stringify(frame)}\n`);
-		const flushResult = stdin.flush();
-		if (isPromise(flushResult)) {
-			flushResult.catch((err: Error) => {
-				onError?.(err);
-			});
+		const frames =
+			this.#protocolVersion === 2
+				? this.#frameEncoder.encodeFrames(frame, { rejectOversizedLogicalFrame: true })
+				: [`${JSON.stringify(frame)}\n`];
+		for (const encoded of frames) {
+			const writeResult = stdin.write(encoded);
+			if (isPromise(writeResult)) writeResult.catch((err: Error) => onError?.(err));
 		}
+		const flushResult = stdin.flush();
+		if (isPromise(flushResult)) flushResult.catch((err: Error) => onError?.(err));
 	}
 
 	#getData<T>(response: RpcResponse): T {

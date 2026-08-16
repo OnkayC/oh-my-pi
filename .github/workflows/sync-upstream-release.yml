@@ -1,0 +1,108 @@
+name: Sync upstream release
+
+# GitHub only emits release events in the repository that publishes them.
+# Poll upstream so this fork can react without upstream-side configuration.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: can1357/oh-my-pi
+  TARGET_BRANCH: main
+
+jobs:
+  sync:
+    name: Merge latest published upstream release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+          fetch-depth: 0
+
+      - name: Merge release or open conflict pull request
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag=$(gh api "repos/${UPSTREAM_REPOSITORY}/releases?per_page=100" \
+            --jq '[.[] | select(.draft == false and .published_at != null)] | max_by(.published_at) | .tag_name // empty')
+          if [[ -z "$release_tag" ]]; then
+            echo "No published release found in ${UPSTREAM_REPOSITORY}."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --force upstream "refs/tags/${release_tag}:refs/tags/${release_tag}"
+          git fetch origin "$TARGET_BRANCH"
+
+          release_commit=$(git rev-parse "${release_tag}^{commit}")
+          git checkout -B "$TARGET_BRANCH" "origin/${TARGET_BRANCH}"
+
+          if git merge-base --is-ancestor "$release_commit" HEAD; then
+            echo "Upstream release ${release_tag} is already present on ${TARGET_BRANCH}."
+            exit 0
+          fi
+
+          if git merge --no-ff "$release_commit" -m "Merge upstream release ${release_tag}"; then
+            git push origin "HEAD:${TARGET_BRANCH}"
+            echo "Merged upstream release ${release_tag} into ${TARGET_BRANCH}."
+            exit 0
+          fi
+
+          unmerged_files=$(git diff --name-only --diff-filter=U)
+          if [[ -z "$unmerged_files" ]]; then
+            git merge --abort || true
+            echo "The merge failed without producing conflicts." >&2
+            exit 1
+          fi
+
+          echo "Merge conflicts detected:"
+          printf '%s\n' "$unmerged_files"
+          git merge --abort
+
+          safe_tag=$(printf '%s' "$release_tag" | tr -c 'A-Za-z0-9._-' '-')
+          conflict_branch="upstream-release/${safe_tag:0:80}-${release_commit:0:12}"
+          git checkout -B "$conflict_branch" "$release_commit"
+          git push origin "HEAD:refs/heads/${conflict_branch}"
+
+          existing_pr=$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$TARGET_BRANCH" \
+            --head "$conflict_branch" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+          if [[ -n "$existing_pr" ]]; then
+            echo "Conflict pull request #${existing_pr} already exists."
+            exit 0
+          fi
+
+          body_file="$RUNNER_TEMP/upstream-release-pr.md"
+          cat > "$body_file" <<EOF
+          The automated merge of upstream release ${release_tag} into ${TARGET_BRANCH} found conflicts.
+
+          This branch points at upstream release commit ${release_commit}, so the conflicts can be resolved in this pull request.
+
+          Upstream release: https://github.com/${UPSTREAM_REPOSITORY}/releases/tag/${release_tag}
+          EOF
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$TARGET_BRANCH" \
+            --head "$conflict_branch" \
+            --title "chore: merge upstream release ${release_tag}" \
+            --body-file "$body_file"
