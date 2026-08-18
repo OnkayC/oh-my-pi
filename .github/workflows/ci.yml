@@ -75,9 +75,8 @@ jobs:
    # a second release.
    release_metadata:
       name: Resolve release metadata
-      # Hosted so the tag probe gates release jobs without occupying a build
-      # runner.
-      runs-on: ubuntu-22.04
+      # This lightweight gate always runs on a standard GitHub-hosted runner.
+      runs-on: ubuntu-24.04
       outputs:
          is-release: ${{ steps.detect.outputs.is-release }}
          release-tag: ${{ steps.detect.outputs.release-tag }}
@@ -106,7 +105,7 @@ jobs:
    check:
       name: Lint, type check & web build
       if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || (github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata') }}
+      runs-on: ubuntu-24.04
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -116,35 +115,14 @@ jobs:
            run: bun run collab:web:build
 
    # Rust validation (tests, clippy, rustfmt) runs on non-PR, non-tag events.
-   # Native-changing PRs are rare enough that they do not warrant PR-side
-   # Rust validation or a PR-side addon build (see native_addons): Rust is
-   # validated post-merge on main (kata remote cache, warm).
+   # Native-changing PRs are rare enough that Rust remains a post-merge check;
+   # pull requests exercise TypeScript against the latest released addons.
    rust_validate:
       name: Validate Rust workspace (bazel)
       if: ${{ github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/v') }}
-      runs-on: ${{ github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       steps:
          - uses: actions/checkout@v4
-         - uses: bazelbuild/setup-bazelisk@v3
-           if: github.repository_owner == 'OnkayC'
-         - name: Expose Bazelisk command
-           if: github.repository_owner == 'OnkayC'
-           run: |
-              mkdir -p "$RUNNER_TEMP/bin"
-              ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
-              echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-         - uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3
-           if: github.repository_owner == 'OnkayC'
-           with:
-              cmake-version: 3.31.x
-         - uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
-           if: github.repository_owner == 'OnkayC'
-         - name: Expose native build tools
-           if: github.repository_owner == 'OnkayC'
-           run: |
-              mkdir -p "$HOME/.local/bin"
-              ln -sf "$(command -v cmake)" "$HOME/.local/bin/cmake"
-              ln -sf "$(command -v ninja)" "$HOME/.local/bin/ninja"
          - uses: ./.github/actions/bun-install
          - id: cache
            uses: ./.github/actions/bazel-cache
@@ -184,33 +162,13 @@ jobs:
    # skips its version sentinel for workspace loads, so release addons load
    # fine under a newer checkout; a PR whose TS tests depend on changed
    # native behavior fails visibly and the native side lands via main.
-   # Main (kata, cluster remote cache) builds all Linux-hosted targets with
-   # bazel. Job name says "bazel" for continuity with required checks.
+   # Main builds all Linux-hosted targets with Bazel. Job name says "bazel"
+   # for continuity with required checks.
    native_addons:
       name: Build native addons (bazel)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || (github.repository_owner == 'OnkayC' && 'oh-my-pi-ci' || 'omp-kata') }}
+      runs-on: ubuntu-24.04
       steps:
          - uses: actions/checkout@v4
-         - uses: bazelbuild/setup-bazelisk@v3
-           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
-         - name: Expose Bazelisk command
-           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
-           run: |
-              mkdir -p "$RUNNER_TEMP/bin"
-              ln -sf "$(command -v bazel)" "$RUNNER_TEMP/bin/bazelisk"
-              echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-         - uses: jwlawson/actions-setup-cmake@0d6a7d60b009d01c9e7523be22153ff8f19460d3
-           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
-           with:
-              cmake-version: 3.31.x
-         - uses: seanmiddleditch/gha-setup-ninja@7e868db0f3406270dd46e1dac26c65f621456723
-           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
-         - name: Expose native build tools
-           if: github.repository_owner == 'OnkayC' && github.event_name != 'pull_request'
-           run: |
-              mkdir -p "$HOME/.local/bin"
-              ln -sf "$(command -v cmake)" "$HOME/.local/bin/cmake"
-              ln -sf "$(command -v ninja)" "$HOME/.local/bin/ninja"
 
          # ---- PR path: latest release addons from npm ----
          - name: Fetch release native addons (npm)
@@ -262,7 +220,7 @@ jobs:
                 echo "::notice title=Native sources changed::PR CI tests against the latest release addons by design; native changes are validated post-merge on main and at release."
               fi
 
-         # ---- main path: bazel build of all Linux-hosted targets ----
+         # ---- main path: hosted Bazel build of all Linux targets ----
          - id: cache
            if: github.event_name != 'pull_request'
            uses: ./.github/actions/bazel-cache
@@ -308,7 +266,7 @@ jobs:
 
    test_workspace:
       name: Test TS workspace fast
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 20
@@ -331,7 +289,7 @@ jobs:
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 20
@@ -349,7 +307,7 @@ jobs:
 
    test_ts_native:
       name: Test TS native/integration packages
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
@@ -367,7 +325,7 @@ jobs:
 
    test_coding_agent_ui:
       name: Test coding-agent UI/TUI (TS)
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
@@ -385,7 +343,7 @@ jobs:
 
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
@@ -405,7 +363,7 @@ jobs:
 
    test_coding_agent_native:
       name: Test coding-agent native/unit (TS)
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
@@ -423,7 +381,7 @@ jobs:
 
    test_smoke:
       name: Test CLI smoke (TS)
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 15
@@ -439,7 +397,7 @@ jobs:
 
    install_methods:
       name: Install method smoke tests
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       steps:
@@ -461,7 +419,7 @@ jobs:
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
          needs.native_addons.result == 'success' }}
       needs: [release_metadata, native_addons]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       steps:
          - run: echo "release validation green"
 
@@ -478,7 +436,7 @@ jobs:
          matrix:
             include:
                - {
-                    os: ubuntu-22.04,
+                    os: ubuntu-24.04,
                     platform: linux,
                     arch: x64,
                     target_id: linux-x64,
@@ -619,7 +577,7 @@ jobs:
          needs.release_binary_darwin.result == 'success' &&
          !inputs.skip_npm }}
       needs: [release_metadata, release_gate, release_binary, release_binary_darwin]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       # id-token lets npm mint the OIDC token for trusted publishing; the
       # NODE_AUTH_TOKEN below is the fallback for unconfigured packages.
       permissions:
@@ -677,7 +635,7 @@ jobs:
          needs.release_binary.result == 'success' &&
          needs.release_binary_darwin.result == 'success' }}
       needs: [release_metadata, release_gate, release_binary, release_binary_darwin]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       permissions:
          contents: write
       steps:
@@ -770,7 +728,7 @@ jobs:
       # leaf packages as lockstep-versioned optionalDependencies, so installs
       # resolve them the moment the core version is live.
       needs: [release_metadata, release_binary, release_binary_darwin, release_github_verify, release_native_leaves]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       # `id-token: write` lets npm mint the GitHub OIDC token it exchanges for a
       # short-lived publish token (trusted publishing + provenance). When a
       # package has no matching trusted publisher configured, npm silently falls
@@ -821,7 +779,7 @@ jobs:
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
          needs.release_github_verify.result == 'success' }}
       needs: [release_metadata, release_github_verify]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       env:
          HAS_TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY != '' }}
       steps:
