@@ -64,10 +64,10 @@ describe("stackTip", () => {
 });
 
 describe("planUpstreamReleaseStack", () => {
-	test("opens one PR against main for a single missing tag", () => {
+	test("opens one PR against main for a single missing tag", async () => {
 		const v1 = release("v17.3.7", "sha-v1737");
 		expect(
-			planUpstreamReleaseStack({
+			await planUpstreamReleaseStack({
 				targetBranch: MAIN,
 				mainSha: MAIN_SHA,
 				missingReleases: [v1],
@@ -85,12 +85,12 @@ describe("planUpstreamReleaseStack", () => {
 		]);
 	});
 
-	test("stacks later tags onto the previous release branch instead of main", () => {
+	test("stacks later tags onto the previous release branch instead of main", async () => {
 		const v1 = release("v17.3.6", "sha-v1736");
 		const v2 = release("v17.3.7", "sha-v1737");
 		const firstBranch = conflictBranchName(v1.tag, v1.sha);
 		expect(
-			planUpstreamReleaseStack({
+			await planUpstreamReleaseStack({
 				targetBranch: MAIN,
 				mainSha: MAIN_SHA,
 				missingReleases: [v1, v2],
@@ -109,12 +109,12 @@ describe("planUpstreamReleaseStack", () => {
 		]);
 	});
 
-	test("stacks a newer tag onto an already-open first release PR", () => {
+	test("stacks a newer tag onto an already-open first release PR", async () => {
 		const v1 = release("v17.3.5", "sha-v1735");
 		const v2 = release("v17.3.7", "sha-v1737");
 		const firstHead = conflictBranchName(v1.tag, v1.sha);
 		expect(
-			planUpstreamReleaseStack({
+			await planUpstreamReleaseStack({
 				targetBranch: MAIN,
 				mainSha: MAIN_SHA,
 				missingReleases: [v1, v2],
@@ -132,13 +132,13 @@ describe("planUpstreamReleaseStack", () => {
 		]);
 	});
 
-	test("skips tags already contained in the current stack tip", () => {
+	test("skips tags already contained in the current stack tip", async () => {
 		const v1 = release("v17.3.5", "sha-v1735");
 		const v2 = release("v17.3.6", "sha-v1736");
 		const v3 = release("v17.3.7", "sha-v1737");
 		const firstHead = conflictBranchName(v2.tag, v2.sha);
 		expect(
-			planUpstreamReleaseStack({
+			await planUpstreamReleaseStack({
 				targetBranch: MAIN,
 				mainSha: MAIN_SHA,
 				missingReleases: [v1, v2, v3],
@@ -156,13 +156,13 @@ describe("planUpstreamReleaseStack", () => {
 		]);
 	});
 
-	test("retargets a parallel main PR onto the older stack entry", () => {
+	test("retargets a parallel main PR onto the older stack entry", async () => {
 		const v1 = release("v17.3.5", "sha-v1735");
 		const v2 = release("v17.3.7", "sha-v1737");
 		const firstHead = conflictBranchName(v1.tag, v1.sha);
 		const secondHead = conflictBranchName(v2.tag, v2.sha);
 		expect(
-			planUpstreamReleaseStack({
+			await planUpstreamReleaseStack({
 				targetBranch: MAIN,
 				mainSha: MAIN_SHA,
 				missingReleases: [v1, v2],
@@ -172,11 +172,25 @@ describe("planUpstreamReleaseStack", () => {
 		).toEqual([{ type: "retarget_pr", number: 15, base: firstHead }]);
 	});
 
-	test("retargets an orphan stacked PR onto main when the base PR is gone", () => {
+	test("keeps the existing main PR when the same release branch is stacked elsewhere", async () => {
+		const v1 = release("v3.25.0", "sha-v3250");
+		const head = conflictBranchName(v1.tag, v1.sha);
+		expect(
+			await planUpstreamReleaseStack({
+				targetBranch: MAIN,
+				mainSha: MAIN_SHA,
+				missingReleases: [v1],
+				openPrs: [pr(17, MAIN, head, v1.sha), pr(372, "upstream-release/older", head, v1.sha)],
+				isAncestor: (commit, tip) => commit === tip,
+			}),
+		).toEqual([]);
+	});
+
+	test("retargets an orphan stacked PR onto main when the base PR is gone", async () => {
 		const v2 = release("v17.3.7", "sha-v1737");
 		const secondHead = conflictBranchName(v2.tag, v2.sha);
 		expect(
-			planUpstreamReleaseStack({
+			await planUpstreamReleaseStack({
 				targetBranch: MAIN,
 				mainSha: MAIN_SHA,
 				missingReleases: [v2],

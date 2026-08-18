@@ -58,13 +58,13 @@ export function stackTip(
 	}
 }
 
-export function planUpstreamReleaseStack(input: {
+export async function planUpstreamReleaseStack(input: {
 	targetBranch: string;
 	mainSha: string;
 	missingReleases: readonly UpstreamRelease[];
 	openPrs: readonly OpenReleasePr[];
-	isAncestor: (commit: string, tip: string) => boolean;
-}): StackAction[] {
+	isAncestor: (commit: string, tip: string) => boolean | Promise<boolean>;
+}): Promise<StackAction[]> {
 	const openPrs = input.openPrs.map(pr => ({ ...pr }));
 	const actions: StackAction[] = [];
 	let { branch: tipBranch, sha: tipSha, heads } = stackTip(input.targetBranch, input.mainSha, openPrs);
@@ -82,7 +82,7 @@ export function planUpstreamReleaseStack(input: {
 	}
 
 	for (const release of input.missingReleases) {
-		if (input.isAncestor(release.sha, tipSha)) continue;
+		if (await input.isAncestor(release.sha, tipSha)) continue;
 
 		const branch = conflictBranchName(release.tag, release.sha);
 		const existing = openPrs.find(pr => pr.sha === release.sha || pr.head === branch);
@@ -140,21 +140,14 @@ async function listPublishedReleases(upstream: string): Promise<PublishedRelease
 
 async function listOpenReleasePrs(repo: string): Promise<OpenReleasePr[]> {
 	const raw =
-		await $`gh pr list --repo ${repo} --state open --limit 100 --json number,baseRefName,headRefName,headRefOid`.text();
-	const parsed = JSON.parse(raw) as Array<{
-		number: number;
-		baseRefName: string;
-		headRefName: string;
-		headRefOid: string;
-	}>;
-	return parsed
-		.filter(pr => pr.headRefName.startsWith(RELEASE_PR_PREFIX))
-		.map(pr => ({
-			number: pr.number,
-			base: pr.baseRefName,
-			head: pr.headRefName,
-			sha: pr.headRefOid,
-		}));
+		await $`gh api --paginate ${`repos/${repo}/pulls?state=open&per_page=100`} --jq ${`.[] | select(.head.ref | startswith("${RELEASE_PR_PREFIX}")) | {number, base: .base.ref, head: .head.ref, sha: .head.sha}`}`.text();
+	const openPrs: OpenReleasePr[] = [];
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (trimmed.length === 0) continue;
+		openPrs.push(JSON.parse(trimmed) as OpenReleasePr);
+	}
+	return openPrs;
 }
 
 async function isAncestor(commit: string, tip: string): Promise<boolean> {
@@ -309,27 +302,12 @@ async function main(): Promise<void> {
 		openPrs = await listOpenReleasePrs(repo);
 	}
 
-	const ancestorCache = new Map<string, boolean>();
-	const isAncestorSync = (commit: string, tip: string): boolean => {
-		const key = `${commit}|${tip}`;
-		const cached = ancestorCache.get(key);
-		if (cached !== undefined) return cached;
-		throw new Error(`ancestor cache miss for ${key}`);
-	};
-	const tips = new Set<string>([mainSha, ...openPrs.map(pr => pr.sha), ...remaining.map(release => release.sha)]);
-	const commits = new Set<string>([...remaining.map(release => release.sha), ...openPrs.map(pr => pr.sha)]);
-	for (const commit of commits) {
-		for (const tip of tips) {
-			ancestorCache.set(`${commit}|${tip}`, await isAncestor(commit, tip));
-		}
-	}
-
-	const actions = planUpstreamReleaseStack({
+	const actions = await planUpstreamReleaseStack({
 		targetBranch,
 		mainSha,
 		missingReleases: remaining,
 		openPrs,
-		isAncestor: isAncestorSync,
+		isAncestor,
 	});
 	if (actions.length === 0) {
 		console.log("No stacked release pull requests to open.");
