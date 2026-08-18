@@ -53,8 +53,10 @@ describe("isPermissionDeniedError", () => {
 
 describe("writeFileWithFallback", () => {
 	const disposers: Array<() => void> = [];
-	afterEach(() => {
+	const tempRoots: string[] = [];
+	afterEach(async () => {
 		for (const dispose of disposers.splice(0)) dispose();
+		for (const dir of tempRoots.splice(0)) await fs.rm(dir, { recursive: true, force: true });
 	});
 
 	/** A `BunFile`-shaped stub whose `.write()` always fails with `error`. */
@@ -123,6 +125,7 @@ describe("writeFileWithFallback", () => {
 		// creates the directory and repeats the write. This stub keeps failing, which
 		// pins the retry at exactly one extra attempt instead of spinning.
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "fallback-race-"));
+		tempRoots.push(root);
 		let attempts = 0;
 		let handlerCalled = false;
 		disposers.push(
@@ -145,8 +148,6 @@ describe("writeFileWithFallback", () => {
 		expect(handlerCalled).toBe(false);
 		// The repair is the reason the retry happened, so it must be observable.
 		expect((await fs.stat(path.join(root, "fresh"))).isDirectory()).toBe(true);
-
-		await fs.rm(root, { recursive: true, force: true });
 	});
 
 	it("rethrows the ORIGINAL error when the handler returns false", async () => {

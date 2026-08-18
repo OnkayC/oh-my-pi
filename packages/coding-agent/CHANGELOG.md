@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound extension file write/delete fallback handlers with the extension timeout so a hung handler declines and the next one can run.
+- Rejected `/stats --host` when the following token is another option, and formatted ignored IPv6 dashboard requests through `formatStatsDashboardUrl`.
+
+
 ## [17.3.7] - 2026-08-17
 
 ### Changed

@@ -4,6 +4,15 @@
  * Handles `omp stats` subcommand for viewing AI usage statistics.
  */
 
+import {
+	closeDb,
+	formatStatsDashboardUrl,
+	getDashboardStats,
+	getTotalMessageCount,
+	startServer,
+	syncAllSessions,
+} from "@oh-my-pi/omp-stats";
+
 import { truncateToWidth } from "@oh-my-pi/pi-tui/utils";
 import { formatDuration, formatNumber, formatPercent } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
@@ -77,10 +86,6 @@ function normalizePremiumRequests(n: number): number {
 // =============================================================================
 
 export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
-	// Lazy import to avoid loading stats module when not needed
-	const { closeDb, formatStatsDashboardUrl, getDashboardStats, getTotalMessageCount, startServer, syncAllSessions } =
-		await import("@oh-my-pi/omp-stats");
-
 	// Sync session files first
 	const progress = createSyncProgressReporter();
 	process.stderr.write("Syncing session files...\n");
@@ -122,7 +127,6 @@ export async function runStatsCommand(cmd: StatsCommandArgs): Promise<void> {
 }
 
 async function printStatsSummary(): Promise<void> {
-	const { getDashboardStats } = await import("@oh-my-pi/omp-stats");
 	const stats = await getDashboardStats();
 	const { overall, byModel, byFolder } = stats;
 

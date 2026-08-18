@@ -52,7 +52,7 @@ export function parseStatsDashboardArgs(args: string): StatsDashboardArgs | { er
 		}
 		if (token === "--host") {
 			const value = tokens[++i];
-			if (!value) return { error: `Missing host. ${STATS_DASHBOARD_USAGE}` };
+			if (!value || value.startsWith("-")) return { error: `Missing host. ${STATS_DASHBOARD_USAGE}` };
 			host = value;
 			continue;
 		}
@@ -83,7 +83,7 @@ export async function launchStatsDashboard(args: StatsDashboardArgs): Promise<St
 	openUtils.openPath(url);
 
 	const serverLine = requestedAddressIgnored
-		? `Dashboard already running at: ${url} (requested ${args.host}:${args.port} ignored)`
+		? `Dashboard already running at: ${url} (requested ${stats.formatStatsDashboardUrl(args.host, args.port)} ignored)`
 		: `Dashboard available at: ${url}`;
 
 	return {

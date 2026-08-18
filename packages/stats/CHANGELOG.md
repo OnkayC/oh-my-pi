@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Rejected malformed and out-of-range `--port` values in the standalone stats CLI instead of coercing them with `parseInt`.
+
+
 ## [17.3.6] - 2026-08-17
 
 ### Fixed
