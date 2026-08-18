@@ -3,6 +3,7 @@ import {
 	conflictBranchName,
 	type OpenReleasePr,
 	planUpstreamReleaseStack,
+	releasesNewerThan,
 	stackTip,
 	type UpstreamRelease,
 } from "./sync-upstream-release";
@@ -38,6 +39,16 @@ describe("conflictBranchName", () => {
 		expect(conflictBranchName("v17.3.7+build", "abc123def4567890")).toBe(
 			"upstream-release/v17.3.7-build-abc123def456",
 		);
+	});
+});
+
+describe("releasesNewerThan", () => {
+	test("excludes historical and current releases", () => {
+		const releases = ["v17.3.5", "v17.3.7", "v17.3.8", "v18.0.0"].map((tag, index) => ({
+			tag,
+			publishedAt: String(index),
+		}));
+		expect(releasesNewerThan(releases, "17.3.7").map(release => release.tag)).toEqual(["v17.3.8", "v18.0.0"]);
 	});
 });
 

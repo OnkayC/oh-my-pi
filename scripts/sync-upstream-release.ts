@@ -120,9 +120,13 @@ function firstMissingPr(
 	return candidates.toSorted((a, b) => a.number - b.number)[0];
 }
 
-interface PublishedRelease {
+export interface PublishedRelease {
 	tag: string;
 	publishedAt: string;
+}
+
+export function releasesNewerThan(releases: readonly PublishedRelease[], currentVersion: string): PublishedRelease[] {
+	return releases.filter(release => Bun.semver.order(release.tag.replace(/^v/, ""), currentVersion) > 0);
 }
 
 async function listPublishedReleases(upstream: string): Promise<PublishedRelease[]> {
@@ -260,13 +264,22 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	const refspecs = published.map(release => `refs/tags/${release.tag}:refs/tags/${release.tag}`);
+	const manifest = (await Bun.file(`${import.meta.dir}/../packages/coding-agent/package.json`).json()) as {
+		version: string;
+	};
+	const newReleases = releasesNewerThan(published, manifest.version);
+	if (newReleases.length === 0) {
+		console.log(`No upstream releases are newer than v${manifest.version}.`);
+		return;
+	}
+
+	const refspecs = newReleases.map(release => `refs/tags/${release.tag}:refs/tags/${release.tag}`);
 	await $`git fetch --force upstream ${refspecs}`;
 	await $`git fetch origin ${targetBranch}`;
 	await $`git checkout -B ${targetBranch} ${`origin/${targetBranch}`}`;
 
 	const releases: UpstreamRelease[] = [];
-	for (const release of published) {
+	for (const release of newReleases) {
 		const sha = (await $`git rev-parse ${`${release.tag}^{commit}`}`.text()).trim();
 		releases.push({ tag: release.tag, sha });
 	}
