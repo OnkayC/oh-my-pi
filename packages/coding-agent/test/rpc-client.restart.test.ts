@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import * as path from "node:path";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
+import { MAX_RPC_FRAME_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
 import { type ChildProcess, ptree, TempDir } from "@oh-my-pi/pi-utils";
 
 const MOCK_AGENT = path.join(import.meta.dir, "fixtures", "mock-rpc-agent.ts");
@@ -28,6 +29,45 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 			{ role: "user", content: "first", timestamp: 1 },
 			{ role: "assistant", content: [{ type: "text", text: "second" }], timestamp: 2 },
 		]);
+	}, 20_000);
+
+	test("chunks oversized commands after protocol v2 negotiation", async () => {
+		using tempDir = TempDir.createSync("@omp-rpc-v2-command-");
+		const commandCaptureFile = tempDir.join("commands.jsonl");
+		const physicalCaptureFile = tempDir.join("physical.jsonl");
+		const message = "x".repeat(MAX_RPC_FRAME_BYTES + 1024);
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: {
+				MOCK_RPC_V2: "1",
+				MOCK_RPC_CAPTURE_FILE: commandCaptureFile,
+				MOCK_RPC_PHYSICAL_CAPTURE_FILE: physicalCaptureFile,
+			},
+		});
+
+		await client.start();
+		await client.prompt(message);
+		await client.abort();
+
+		const physicalLines = (await Bun.file(physicalCaptureFile).text()).trim().split("\n");
+		for (const line of physicalLines) {
+			expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
+		}
+		const physicalFrames = physicalLines.map(line => JSON.parse(line) as Record<string, unknown>);
+		const chunks = physicalFrames.filter(frame => frame.type === "rpc_chunk");
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(chunks.every(frame => frame.count === chunks.length)).toBe(true);
+		expect(physicalFrames.filter(frame => frame.type !== "rpc_chunk").map(frame => frame.type)).toEqual([
+			"negotiate_protocol",
+			"abort",
+		]);
+
+		const commands = (await Bun.file(commandCaptureFile).text())
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const prompt = commands.find(frame => frame.type === "prompt");
+		expect(prompt).toMatchObject({ type: "prompt", message });
 	}, 20_000);
 
 	test("normalizes omitted state fields and a runtime-invalid tokensPerSecond", async () => {

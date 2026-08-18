@@ -18,7 +18,12 @@ import { withFileMutationSession } from "../../tools/file-write-fallback";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { RegisteredTool, ToolCallEventResult } from "./types";
+import type {
+	ExtensionToolApprovalDecision,
+	ExtensionToolApprovalRequest,
+	RegisteredTool,
+	ToolCallEventResult,
+} from "./types";
 
 /**
  * Adapts a RegisteredTool into an AgentTool.
@@ -138,6 +143,20 @@ function safetyCheckLines(checks: readonly ComputerSafetyCheck[]): string[] {
 	});
 }
 
+function structuredApprovalDetails(tool: AgentTool, args: unknown): string[] {
+	const details: string[] = [];
+	if (tool.name.startsWith("mcp__") && tool.approval === undefined) details.push("Origin: MCP server tool");
+	const formatted = tool.formatApprovalDetails?.(args);
+	if (typeof formatted === "string") {
+		if (formatted.length > 0) details.push(approvalData(formatted));
+	} else if (Array.isArray(formatted)) {
+		for (const detail of formatted) {
+			if (typeof detail === "string" && detail.length > 0) details.push(approvalData(detail));
+		}
+	}
+	return details;
+}
+
 /**
  * Wraps a tool with extension callbacks for interception.
  * - Emits tool_call event before execution (can block)
@@ -152,6 +171,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 	declare label: string;
 	declare strict: boolean;
 
+	#approvalGrantSessionId: string | undefined;
 	constructor(
 		private tool: AgentTool<TParameters, TDetails>,
 		private runner: ExtensionRunner,
@@ -266,19 +286,30 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
 			reason: resolved.reason,
 		};
+		const sessionId = context?.sessionManager?.getSessionId() ?? "";
+		const uiContext = this.runner.hasUI() ? this.runner.getUIContext() : undefined;
+		if (this.#approvalGrantSessionId && this.#approvalGrantSessionId !== sessionId) {
+			this.#approvalGrantSessionId = undefined;
+		}
+		// Explicit per-tool "prompt" policies and argument-dependent overrides must
+		// still prompt even when a prior approve_session grant exists for this tool.
+		const sessionGrantApplies =
+			!explicitPrompt &&
+			pendingSafetyChecks.length === 0 &&
+			sessionId.length > 0 &&
+			(this.#approvalGrantSessionId === sessionId ||
+				uiContext?.hasToolApprovalGrant?.(sessionId, this.tool.name) === true);
 
-		if (approvalCheck.required) {
-			const scheduledCall = context?.toolCall?.toolCalls[context.toolCall.index];
+		if (approvalCheck.required && !sessionGrantApplies) {
+			const scheduledCall = context?.toolCall?.toolCalls?.[context.toolCall.index];
 			if (
 				scheduledCall?.id === toolCallId &&
 				(scheduledCall.name === this.tool.name || scheduledCall.name === this.tool.customWireName)
 			) {
 				await untilAborted(signal, () => this.runner.waitForToolApprovalPreview(toolCallId));
 			}
-
 			const hasApprovalHandlers =
 				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
-			const sessionId = context?.sessionManager?.getSessionId() ?? "";
 			if (hasApprovalHandlers) {
 				await this.runner.emit({
 					type: "tool_approval_requested",
@@ -304,7 +335,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 			// Provider safety checks fail closed without an interactive prompt. Unlike
 			// ordinary tier approval, no setting or yolo mode may bypass this gate.
-			if (!this.runner.hasUI()) {
+			if (!uiContext) {
 				const reason = "no interactive UI available";
 				await emitApprovalResolved(false, reason);
 				if (pendingSafetyChecks.length > 0) {
@@ -321,23 +352,53 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				);
 			}
 
-			const uiContext = this.runner.getUIContext();
-			const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
-			const safetyPrompt =
-				pendingSafetyChecks.length > 0
-					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
-					: basePrompt;
-			let choice: string | undefined;
+			// Session grants must not cover explicit prompt policies (config or
+			// argument-dependent override), so do not offer approve_session then.
+			const mayApproveSession = !explicitPrompt && pendingSafetyChecks.length === 0 && sessionId.length > 0;
+			const allowedDecisions: ExtensionToolApprovalDecision[] = mayApproveSession
+				? ["approve_once", "approve_session", "deny", "cancel"]
+				: ["approve_once", "deny", "cancel"];
+			let decision: ExtensionToolApprovalDecision;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				if (uiContext.requestToolApproval) {
+					const request: ExtensionToolApprovalRequest = {
+						sessionId,
+						toolCallId,
+						toolName: this.tool.name,
+						approvalMode,
+						tier: resolved.tier,
+						arguments: resolvedArgs,
+						...(approvalCheck.reason ? { reason: approvalCheck.reason } : {}),
+						details: structuredApprovalDetails(this.tool, resolvedArgs),
+						providerSafetyChecks: pendingSafetyChecks.map(check =>
+							approvalData(check.message || check.code || check.id),
+						),
+						allowedDecisions,
+					};
+					const received = await uiContext.requestToolApproval(request, { signal });
+					decision = allowedDecisions.includes(received) ? received : "cancel";
+				} else {
+					const basePrompt = formatApprovalPrompt(this.tool, resolvedArgs, approvalCheck.reason);
+					const safetyPrompt =
+						pendingSafetyChecks.length > 0
+							? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
+							: basePrompt;
+					const choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+					decision = choice === "Approve" ? "approve_once" : "deny";
+				}
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				throw err;
 			}
-			const approved = choice === "Approve";
-			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
+
+			const approved = decision === "approve_once" || decision === "approve_session";
+			const rejectionReason = decision === "cancel" ? "cancelled by user" : approved ? undefined : "denied by user";
+			await emitApprovalResolved(approved, rejectionReason);
 			if (!approved) {
-				throw new Error(`Tool call denied by user: ${this.tool.name}`);
+				throw new Error(`Tool call ${rejectionReason}: ${this.tool.name}`);
+			}
+			if (decision === "approve_session" && !uiContext.hasToolApprovalGrant) {
+				this.#approvalGrantSessionId = sessionId;
 			}
 			if (pendingSafetyChecks.length > 0) {
 				if (!context) throw new Error("Provider safety approval context is unavailable");

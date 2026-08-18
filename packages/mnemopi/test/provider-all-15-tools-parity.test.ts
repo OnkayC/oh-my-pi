@@ -75,6 +75,8 @@ describe("provider all-tools parity", () => {
 		expect(schemaFor("mnemopi_import").required).toContain("input_path");
 	});
 
+	// Under bun --parallel=8 on loaded CI runners this multi-call path has
+	// exceeded the 5s default; keep the full surface check but allow headroom.
 	it("returns user-facing argument errors instead of mutating on missing arguments", async () => {
 		for (const [name, args, expected] of [
 			["mnemopi_remember", {}, "content is required"],
@@ -88,7 +90,7 @@ describe("provider all-tools parity", () => {
 			const result = await handleToolCall(name, args);
 			expect(result.error).toBe(expected);
 		}
-	});
+	}, 30_000);
 
 	it("exports provider data to a file and imports it into a fresh isolated bank", async () => {
 		const remembered = await handleToolCall("mnemopi_remember", {

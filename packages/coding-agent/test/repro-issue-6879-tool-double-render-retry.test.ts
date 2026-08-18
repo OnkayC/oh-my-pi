@@ -98,6 +98,7 @@ describe("issue #6879 — tool output appears twice after a superseded turn", ()
 			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
 			settings: Settings.isolated(),
 			modelRegistry,
+			builtInToolNames: ["bash", "read"],
 		});
 		// The session is constructed with no tools; bash is a built-in in real
 		// sessions, so provenance-gated rendering must treat it as one here.

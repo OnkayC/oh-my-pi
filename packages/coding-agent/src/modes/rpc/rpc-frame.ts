@@ -10,6 +10,27 @@ export const MAX_RPC_REASSEMBLED_BYTES = 64 * 1024 * 1024;
 const RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024;
 
 export type RpcProtocolVersion = 1 | 2;
+export interface RpcFrameEncodingOptions {
+	/** Reject instead of truncating or emitting a compact fallback for an oversized logical frame. */
+	rejectOversizedLogicalFrame?: boolean;
+}
+
+/** Raised when an outbound logical frame cannot be represented losslessly by the negotiated transport. */
+export class RpcFrameTooLargeError extends Error {
+	constructor(
+		frame: object,
+		readonly byteLength: number,
+		readonly limit = MAX_RPC_REASSEMBLED_BYTES,
+	) {
+		const frameType = isRecord(frame) && typeof frame.type === "string" ? frame.type : "unknown";
+		const limitDescription =
+			limit === MAX_RPC_REASSEMBLED_BYTES
+				? `protocol v2 reassembly limit of ${limit} bytes`
+				: `transport limit of ${limit} bytes`;
+		super(`RPC ${frameType} frame is ${byteLength} bytes and exceeds the ${limitDescription}`);
+		this.name = "RpcFrameTooLargeError";
+	}
+}
 
 interface PendingRpcChunks {
 	chunkId: string;
@@ -87,15 +108,10 @@ function encodedMessageSnapshot(encoded: string): { message: unknown } | undefin
 /**
  * Emit protocol v2 chunk frames for one pre-serialized logical frame, one physical
  * JSONL line at a time so callers can write with backpressure instead of holding the
- * whole ~4/3-sized base64 transport in memory. The reassembly ceiling is enforced on
- * `Buffer.byteLength` BEFORE any full-payload allocation.
+ * whole ~4/3-sized base64 transport in memory. The caller enforces the reassembly
+ * ceiling before this allocates the full UTF-8 payload.
  */
-function* encodeChunkedRpcFrames(frame: object, json: string, chunkId: string): Generator<string> {
-	const byteLength = Buffer.byteLength(json, "utf8");
-	if (byteLength > MAX_RPC_REASSEMBLED_BYTES) {
-		yield `${JSON.stringify(overflowFrame(frame))}\n`;
-		return;
-	}
+function* encodeChunkedRpcFrames(json: string, chunkId: string, byteLength: number): Generator<string> {
 	const bytes = Buffer.from(json, "utf8");
 	const count = Math.ceil(byteLength / RPC_CHUNK_PAYLOAD_BYTES);
 	for (let index = 0; index < count; index++) {
@@ -284,17 +300,32 @@ export class RpcFrameEncoder {
 	 * stdout with backpressure without holding the whole transport in memory. The
 	 * returned iterable MUST be fully consumed exactly once.
 	 */
-	encodeFrames(frame: object): Iterable<string> {
+	encodeFrames(frame: object, options: RpcFrameEncodingOptions = {}): Iterable<string> {
 		if (isRecord(frame) && frame.type === "agent_start") this.#streamedMessages = [];
 		const json = JSON.stringify(frame);
 		let frames: Iterable<string>;
 		let singleFrame: string | undefined;
+		if (
+			options.rejectOversizedLogicalFrame &&
+			this.#protocolVersion === 1 &&
+			serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES
+		) {
+			throw new RpcFrameTooLargeError(frame, serializedFrameBytes(json), MAX_RPC_FRAME_BYTES);
+		}
 		if (this.#protocolVersion === 2 && serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES) {
 			const compacted = compactTerminalFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
 			// Reuse the original serialization when compaction was a no-op.
 			const compactedJson = compacted === frame ? json : JSON.stringify(compacted);
 			if (serializedFrameBytes(compactedJson) > MAX_RPC_FRAME_BYTES) {
-				frames = encodeChunkedRpcFrames(compacted, compactedJson, `rpc-${++this.#chunkCounter}`);
+				const byteLength = Buffer.byteLength(compactedJson, "utf8");
+				if (byteLength > MAX_RPC_REASSEMBLED_BYTES) {
+					if (options.rejectOversizedLogicalFrame) {
+						throw new RpcFrameTooLargeError(compacted, byteLength, MAX_RPC_REASSEMBLED_BYTES);
+					}
+					frames = [`${JSON.stringify(overflowFrame(compacted))}\n`];
+				} else {
+					frames = encodeChunkedRpcFrames(compactedJson, `rpc-${++this.#chunkCounter}`, byteLength);
+				}
 			} else {
 				singleFrame = `${compactedJson}\n`;
 				frames = [singleFrame];
