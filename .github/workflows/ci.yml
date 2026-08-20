@@ -421,6 +421,13 @@ jobs:
       needs: [release_metadata, native_addons]
       runs-on: ubuntu-24.04
       steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/bun-install
+         # Generated-config drift gate: bazel/clippy.bazelrc is maintained by
+         # scripts/release.ts (like the lockfiles); a stale file only blocks
+         # publishing, never ordinary CI.
+         - name: Check generated clippy config
+           run: bun scripts/gen-clippy-bazelrc.ts --check
          - run: echo "release validation green"
 
    # Builds (does not publish) the Linux-hosted release binaries. Darwin
