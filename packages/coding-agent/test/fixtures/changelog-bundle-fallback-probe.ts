@@ -12,7 +12,11 @@ const latest = entries[0];
 // release entry" — not that the latest entry matches the package version (a
 // release may legally ship without coding-agent changelog content).
 const version = latest ? `${latest.major}.${latest.minor}.${latest.patch}` : undefined;
-if (version === undefined || !latest?.content.startsWith(`## [${version}]`)) {
+const heading = latest?.content.split("\n", 1)[0] ?? "";
+if (
+	version === undefined ||
+	!(heading.startsWith(`## [${version}]`) || heading === `## ${version}` || heading.startsWith(`## ${version} `))
+) {
 	throw new Error(`Bundled changelog fallback did not parse a release entry: ${JSON.stringify({ version })}`);
 }
 

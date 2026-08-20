@@ -1571,6 +1571,7 @@ describe("AskTool rich ask dialog", () => {
 				question: "Q1?",
 				header: "Chip Header",
 				options: [{ label: "Option A", preview: "My Preview" }],
+				allowCustom: true,
 			},
 		]);
 

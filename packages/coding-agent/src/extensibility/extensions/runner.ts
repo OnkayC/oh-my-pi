@@ -227,6 +227,36 @@ function createHandlerContext(
 	return scoped;
 }
 
+async function runFileFallbackHandler<TReq>(
+	handler: (req: TReq, ctx: ExtensionContext) => Promise<boolean>,
+	req: TReq,
+	ctx: ExtensionContext,
+	ext: Extension,
+	kind: "write" | "delete",
+): Promise<boolean> {
+	try {
+		const result = await raceHandlerWithTimeout(
+			(handlerSignal, budget) => handler(req, createHandlerContext(ctx, handlerSignal, budget)),
+			extensionHandlerTimeoutMs,
+		);
+		if (result === EXTENSION_HANDLER_TIMEOUT) {
+			logger.warn(`Extension file ${kind} fallback handler timed out; trying next handler`, {
+				extension: ext.path,
+				timeoutMs: extensionHandlerTimeoutMs,
+			});
+			return false;
+		}
+		if (result === EXTENSION_HANDLER_ABORTED) return false;
+		return result === true;
+	} catch (error) {
+		logger.warn(`Extension file ${kind} fallback handler threw; trying next handler`, {
+			extension: ext.path,
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return false;
+	}
+}
+
 /**
  * Race `work` against a `timeoutMs` budget and optional cancellation signal,
  * clearing the timer and abort listener as soon as one branch settles.
@@ -736,14 +766,7 @@ export class ExtensionRunner {
 					addFileWriteFallback(async req => {
 						const ctx = this.createContext();
 						for (const handler of ext.fileWriteFallbackHandlers) {
-							try {
-								if (await handler(req, ctx)) return true;
-							} catch (error) {
-								logger.warn("Extension file write fallback handler threw; trying next handler", {
-									extension: ext.path,
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
+							if (await runFileFallbackHandler(handler, req, ctx, ext, "write")) return true;
 						}
 						return false;
 					}),
@@ -754,14 +777,7 @@ export class ExtensionRunner {
 					addFileDeleteFallback(async req => {
 						const ctx = this.createContext();
 						for (const handler of ext.fileDeleteFallbackHandlers) {
-							try {
-								if (await handler(req, ctx)) return true;
-							} catch (error) {
-								logger.warn("Extension file delete fallback handler threw; trying next handler", {
-									extension: ext.path,
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
+							if (await runFileFallbackHandler(handler, req, ctx, ext, "delete")) return true;
 						}
 						return false;
 					}),

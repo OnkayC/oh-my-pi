@@ -8,8 +8,21 @@ import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from 
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
-import type { ContextUsage } from "../../extensibility/extensions/types";
+import type {
+	ContextUsage,
+	ExtensionAskDialogQuestion,
+	ExtensionAskDialogResult,
+	ExtensionToolApprovalDecision,
+} from "../../extensibility/extensions/types";
+import type {
+	RpcPlanModeState,
+	RpcPlanReviewDecision,
+	RpcPlanReviewRequest,
+	RpcPlanReviewResolution,
+	RpcPlanWorkflow,
+} from "../../plan-mode/controller";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { HostTurnBoundary } from "../../session/host-turns";
 import type { FileEntry } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type {
@@ -21,18 +34,106 @@ import type {
 import type { TodoPhase } from "../../tools/todo";
 import type { RpcMessagesPage } from "./rpc-messages";
 
+export type {
+	RpcPlanModeState,
+	RpcPlanReviewDecision,
+	RpcPlanReviewRequest,
+	RpcPlanReviewResolution,
+	RpcPlanWorkflow,
+} from "../../plan-mode/controller";
+export type { HostTurnBoundary } from "../../session/host-turns";
+
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
 
+export interface RpcSemanticCapabilities {
+	structuredApprovals?: number;
+	runtimePolicy?: number;
+	authStatus?: number;
+	richUserInput?: number;
+	planControl?: number;
+	planReview?: number;
+	hostTurns?: number;
+	modelCatalog?: number;
+	slashCommands?: number;
+	skills?: number;
+	tasks?: number;
+	subagents?: number;
+}
+
+export type RpcSemanticCapabilityKey = keyof RpcSemanticCapabilities;
+export type RpcApprovalMode = "always-ask" | "write" | "yolo";
+
+export interface RpcAvailableModel extends Model {
+	thinkingEfforts: Effort[];
+	fastModeSupported: boolean;
+}
+
+export type RpcAuthStatusValue = "authenticated" | "unauthenticated" | "expired" | "error";
+
+export interface RpcAuthAccountStatus {
+	type: "api_key" | "oauth";
+	status: Exclude<RpcAuthStatusValue, "unauthenticated">;
+	accountId?: string;
+	email?: string;
+	projectId?: string;
+	enterpriseUrl?: string;
+	orgId?: string;
+	orgName?: string;
+}
+
+export interface RpcAuthProviderStatus {
+	provider: string;
+	status: RpcAuthStatusValue;
+	accounts: RpcAuthAccountStatus[];
+	error?: string;
+}
+
+export interface RpcAuthStatus {
+	providers: RpcAuthProviderStatus[];
+}
+
+export interface RpcAvailableSkill {
+	name: string;
+	description: string;
+	source: string;
+}
+export type RpcFollowUpCommand =
+	| {
+			id?: string;
+			type: "follow_up";
+			message: string;
+			images?: ImageContent[];
+			clientTurnId?: never;
+			optionFingerprint?: never;
+			turnOptions?: never;
+	  }
+	| {
+			id?: string;
+			type: "follow_up";
+			message: string;
+			images?: ImageContent[];
+			clientTurnId: string;
+			optionFingerprint: string;
+			turnOptions?: RpcHostTurnOptions;
+	  };
+
 export type RpcCommand =
 	// Protocol
 	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
-
+	| { id?: string; type: "negotiate_capabilities"; capabilities: RpcSemanticCapabilities }
 	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| {
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			clientTurnId?: string;
+	  }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	| RpcFollowUpCommand
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "new_session"; parentSession?: string }
@@ -41,12 +142,26 @@ export type RpcCommand =
 	| { id?: string; type: "get_state" }
 	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }
+	| { id?: string; type: "set_runtime_policy"; approvalMode: RpcApprovalMode }
+	| { id?: string; type: "get_auth_status" }
+	| { id?: string; type: "get_available_skills" }
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
 	| { id?: string; type: "set_host_uri_schemes"; schemes: RpcHostUriSchemeDefinition[] }
 	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
+	| {
+			id?: string;
+			type: "set_plan_mode";
+			status: RpcPlanModeState["status"];
+			workflow?: RpcPlanWorkflow;
+			planFilePath?: string;
+	  }
+	| { id?: string; type: "respond_to_plan_review"; requestId: string; decision: RpcPlanReviewDecision }
+	| { id?: string; type: "get_turns" }
+	| { id?: string; type: "rollback_turns"; count: number; expectedClientTurnIds: string[] }
+	| { id?: string; type: "cancel_follow_up"; clientTurnId: string }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -98,6 +213,7 @@ export type RpcCommand =
 
 export interface RpcSessionState {
 	model?: Model;
+	approvalMode?: RpcApprovalMode;
 	thinkingLevel: ThinkingLevel | undefined;
 	isStreaming: boolean;
 	isCompacting: boolean;
@@ -119,6 +235,10 @@ export interface RpcSessionState {
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 	/** Current context window usage. */
 	contextUsage?: ContextUsage;
+	/** Negotiated native plan mode state. */
+	planMode?: RpcPlanModeState;
+	/** Durable reviews that can be reconstructed after process loss. */
+	pendingPlanReviews?: Array<{ id: string; title: string; path: string; status: "pending" | "dispatching" }>;
 }
 
 export interface RpcAvailableSlashCommand {
@@ -147,6 +267,7 @@ export interface RpcReadyFrame {
 	supportedProtocolVersions: [1, 2];
 	maxFrameBytes: number;
 	maxReassembledFrameBytes: number;
+	capabilities?: RpcSemanticCapabilities;
 }
 
 export interface RpcChunkFrame {
@@ -188,6 +309,35 @@ export interface RpcSubagentMessagesResult {
 	messages: AgentMessage[];
 }
 
+export interface RpcHostTurnOptions {
+	provider?: string;
+	modelId: string;
+	thinkingLevel?: string;
+	fastMode?: boolean;
+}
+
+export interface RpcFollowUpQueuedNotification {
+	type: "follow_up_queued";
+	clientTurnId: string;
+	optionFingerprint: string;
+	queuePosition: number;
+}
+
+export interface RpcHostTurnPromotedNotification {
+	type: "host_turn_promoted";
+	clientTurnId: string;
+	optionFingerprint: string;
+	model: string;
+	thinkingLevel?: string;
+	fastMode?: boolean;
+}
+
+export interface RpcHostTurnCancelledNotification {
+	type: "host_turn_cancelled";
+	clientTurnId: string;
+	outcome: "cancelled" | "aborted";
+	reason?: string;
+}
 // ============================================================================
 // RPC Responses (stdout)
 // ============================================================================
@@ -202,6 +352,13 @@ export type RpcResponse =
 			success: true;
 			data: { protocolVersion: 2 };
 	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "negotiate_capabilities";
+			success: true;
+			data: { capabilities: RpcSemanticCapabilities };
+	  }
 
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
@@ -210,6 +367,29 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "set_plan_mode"; success: true; data: RpcPlanModeState }
+	| {
+			id?: string;
+			type: "response";
+			command: "respond_to_plan_review";
+			success: true;
+			data: RpcPlanReviewResolution;
+	  }
+	| { id?: string; type: "response"; command: "get_turns"; success: true; data: { turns: HostTurnBoundary[] } }
+	| {
+			id?: string;
+			type: "response";
+			command: "rollback_turns";
+			success: true;
+			data: { removedClientTurnIds: string[]; turns: HostTurnBoundary[]; sessionId: string; sessionFile?: string };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "cancel_follow_up";
+			success: true;
+			data: { cancelled: boolean };
+	  }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
@@ -226,6 +406,27 @@ export type RpcResponse =
 			command: "get_available_commands";
 			success: true;
 			data: { commands: RpcAvailableSlashCommand[] };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_runtime_policy";
+			success: true;
+			data: { approvalMode: RpcApprovalMode };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_auth_status";
+			success: true;
+			data: RpcAuthStatus;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_available_skills";
+			success: true;
+			data: { skills: RpcAvailableSkill[] };
 	  }
 	| { id?: string; type: "response"; command: "set_todos"; success: true; data: { todoPhases: TodoPhase[] } }
 	| { id?: string; type: "response"; command: "set_host_tools"; success: true; data: { toolNames: string[] } }
@@ -272,7 +473,7 @@ export type RpcResponse =
 			type: "response";
 			command: "get_available_models";
 			success: true;
-			data: { models: Model[] };
+			data: { models: Array<Model | RpcAvailableModel> };
 	  }
 
 	// Thinking
@@ -362,14 +563,77 @@ export interface RpcSubagentEventFrame {
 
 export type RpcSubagentFrame = RpcSubagentLifecycleFrame | RpcSubagentProgressFrame | RpcSubagentEventFrame;
 
-export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
+export interface RpcPlanModeChangedFrame extends RpcPlanModeState {
+	type: "plan_mode_changed";
+}
+
+export type RpcPlanReviewRequestFrame = { type: "plan_review_request" } & RpcPlanReviewRequest;
+export type RpcPlanReviewResolvedFrame = { type: "plan_review_resolved" } & RpcPlanReviewResolution;
+export type RpcPlanFrame = RpcPlanModeChangedFrame | RpcPlanReviewRequestFrame | RpcPlanReviewResolvedFrame;
+
+export type RpcHostTurnLifecycleFrame =
+	| RpcFollowUpQueuedNotification
+	| RpcHostTurnPromotedNotification
+	| RpcHostTurnCancelledNotification;
+
+export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame | RpcPlanFrame | RpcHostTurnLifecycleFrame;
+
+// ============================================================================
+// Structured Approval Events (bidirectional)
+// ============================================================================
+
+export type RpcApprovalDecision = ExtensionToolApprovalDecision;
+
+export interface RpcApprovalRequestFrame {
+	type: "approval_request";
+	id: string;
+	sessionId: string;
+	toolCallId: string;
+	toolName: string;
+	approvalMode: RpcApprovalMode;
+	tier: "read" | "write" | "exec";
+	arguments: unknown;
+	reason?: string;
+	details: string[];
+	providerSafetyChecks: string[];
+	allowedDecisions: RpcApprovalDecision[];
+}
+
+export interface RpcApprovalResponseFrame {
+	type: "approval_response";
+	id: string;
+	decision: RpcApprovalDecision;
+}
+
+export interface RpcApprovalResolvedFrame {
+	type: "approval_resolved";
+	id: string;
+	outcome: "accepted" | "denied" | "cancelled" | "timed_out" | "stale" | "aborted";
+	decision?: RpcApprovalDecision;
+}
 
 // ============================================================================
 // Extension UI Events (stdout)
 // ============================================================================
 
+export interface RpcAskRequestFrame {
+	type: "extension_ui_request";
+	id: string;
+	method: "ask";
+	questions: ExtensionAskDialogQuestion[];
+	timeout?: number;
+}
+
+export interface RpcExtensionUIResolvedFrame {
+	type: "extension_ui_resolved";
+	id: string;
+	method: "ask";
+	outcome: "submitted" | "chat" | "cancelled" | "timed_out" | "stale" | "aborted";
+	result?: ExtensionAskDialogResult;
+}
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest =
+	| RpcAskRequestFrame
 	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
 	| {
@@ -531,11 +795,15 @@ export interface RpcHostUriResult {
 // Extension UI Commands (stdin)
 // ============================================================================
 
+export type RpcAskResponseFrame =
+	| { type: "extension_ui_response"; id: string; result: ExtensionAskDialogResult }
+	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
+
 /** Response to an extension UI request */
 export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
-	| { type: "extension_ui_response"; id: string; cancelled: true; timedOut?: boolean };
+	| RpcAskResponseFrame;
 
 // ============================================================================
 // Helper type for extracting command types

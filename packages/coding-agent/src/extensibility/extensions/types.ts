@@ -18,6 +18,7 @@ import type {
 	ThinkingLevel,
 	ToolApproval,
 	ToolLoadMode,
+	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type {
@@ -147,6 +148,7 @@ export interface ExtensionAskDialogQuestion {
 	options: ExtensionAskDialogOption[];
 	multi?: boolean;
 	recommended?: number;
+	allowCustom?: boolean;
 }
 
 export interface ExtensionAskDialogResultItem {
@@ -173,6 +175,21 @@ export interface ExtensionAskDialogChatResult {
 }
 
 export type ExtensionAskDialogResult = ExtensionAskDialogSubmitResult | ExtensionAskDialogChatResult;
+
+export type ExtensionToolApprovalDecision = "approve_once" | "approve_session" | "deny" | "cancel";
+
+export interface ExtensionToolApprovalRequest {
+	sessionId: string;
+	toolCallId: string;
+	toolName: string;
+	approvalMode: ApprovalMode;
+	tier: ToolTier;
+	arguments: unknown;
+	reason?: string;
+	details: string[];
+	providerSafetyChecks: string[];
+	allowedDecisions: ExtensionToolApprovalDecision[];
+}
 
 export function getExtensionUISelectOptionLabel(option: ExtensionUISelectItem): string {
 	return typeof option === "string" ? option : option.label;
@@ -273,6 +290,15 @@ export interface ExtensionUIContext {
 		questions: ExtensionAskDialogQuestion[],
 		dialogOptions?: ExtensionUIDialogOptions,
 	): Promise<ExtensionAskDialogResult | undefined>;
+
+	/** Request a structured tool-approval decision when the host supports it. */
+	requestToolApproval?(
+		request: ExtensionToolApprovalRequest,
+		dialogOptions?: ExtensionUIDialogOptions,
+	): Promise<ExtensionToolApprovalDecision>;
+
+	/** Check whether a prior structured decision granted this tool for the current session. */
+	hasToolApprovalGrant?(sessionId: string, toolName: string): boolean;
 
 	/** Show a notification to the user. */
 	notify(message: string, type?: "info" | "warning" | "error"): void;

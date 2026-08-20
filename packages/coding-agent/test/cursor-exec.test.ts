@@ -54,6 +54,7 @@ function createTestSession(cwd: string, overrides: Partial<ToolSession> = {}): T
  */
 function passthroughRunner(seen: string[] = []): ExtensionRunner {
 	return {
+		hasUI: () => false,
 		hasHandlers: () => true,
 		consumeToolCallEmitted: () => false,
 		emitToolCall: async (event: { toolName: string }) => {

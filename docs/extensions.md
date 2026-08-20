@@ -385,7 +385,7 @@ via `pi.registerFileWriteFallback` before giving up:
 import type { FileWriteFallbackHandler } from "@oh-my-pi/pi-coding-agent";
 
 const writeThroughBroker: FileWriteFallbackHandler = async (req, ctx) => {
-  // req: { dst: string; content: string; cause: unknown }
+  // req: { dst: string; content: string; cause: unknown; sessionId: string | undefined }
   const ok = await myPrivilegedWriter.write(req.dst, req.content);
   return ok;
 };
