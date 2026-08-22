@@ -557,6 +557,72 @@ describe("AgentSession follow-up lifecycle and options", () => {
 		await session.dispose();
 	});
 
+	it("short-circuits identical retries for durable prompts queued while streaming", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const streamStarted = Promise.withResolvers<void>();
+		const finishFirstTurn = Promise.withResolvers<void>();
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			followUpMode: "all",
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				const callIndex = streamCalls++;
+				queueMicrotask(() => {
+					const message = createAssistantMessage(`response ${callIndex + 1}`);
+					stream.push({ type: "start", partial: message });
+					if (callIndex === 0) {
+						streamStarted.resolve();
+						void finishFirstTurn.promise.then(() => stream.push({ type: "done", reason: "stop", message }));
+					} else {
+						stream.push({ type: "done", reason: "stop", message });
+					}
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const firstPrompt = session.prompt("First run");
+		await streamStarted.promise;
+		expect(
+			await session.prompt("Queued durable follow-up", {
+				streamingBehavior: "followUp",
+				clientTurnId: "turn-streaming-retry",
+			}),
+		).toBe(true);
+		expect(agent.peekFollowUpQueue()).toHaveLength(1);
+
+		expect(
+			await session.prompt("Queued durable follow-up", {
+				streamingBehavior: "followUp",
+				clientTurnId: "turn-streaming-retry",
+			}),
+		).toBe(true);
+		expect(agent.peekFollowUpQueue()).toHaveLength(1);
+
+		finishFirstTurn.resolve();
+		await firstPrompt;
+		await session.waitForIdle();
+		expect(streamCalls).toBe(2);
+		expect(
+			session.sessionManager
+				.getHostTurnOperations()
+				.find(operation => operation.clientTurnId === "turn-streaming-retry"),
+		).toMatchObject({ kind: "follow_up", status: "settled", outcome: "completed" });
+
+		await session.dispose();
+		authStorage.close();
+	});
+
 	it("rejects invalid durable turn options before execution while accepting fastMode false", async () => {
 		const initialModel = getBundledModel("anthropic", "claude-haiku-4-5")!;
 		const nonReasoningModel = getBundledModel("openai", "gpt-4o-mini")!;

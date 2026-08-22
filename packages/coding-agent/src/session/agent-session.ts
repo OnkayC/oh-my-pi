@@ -6266,6 +6266,32 @@ export class AgentSession {
 		if (preparedHostTurn?.turnOptions && preparedHostTurn.turnOptions !== options?.turnOptions) {
 			await this.#resolveHostTurnOptions(preparedHostTurn.turnOptions);
 		}
+		// A direct durable retry can enter after the first pipeline claims the
+		// prepared window but before/while it marks the agent busy. Validate the
+		// retry against the persisted operation before the generic streaming guard
+		// so an identical retry short-circuits instead of surfacing AgentBusyError.
+		const existingHostTurn = options?.clientTurnId
+			? this.sessionManager
+					.getHostTurnOperations()
+					.find(operation => operation.clientTurnId === options.clientTurnId)
+			: undefined;
+		if (options?.clientTurnId && !preparedHostTurn && existingHostTurn) {
+			const retryImagePrepModel = options.turnOptions
+				? (await this.#resolveHostTurnOptions(options.turnOptions)).model
+				: this.model;
+			const retryNormalizedImages = await this.#normalizeImagesForModel(options.images, retryImagePrepModel);
+			const retryPreparation = await this.#prepareHostTurn(
+				options.clientTurnId,
+				options.hostTurnKind ?? existingHostTurn.kind,
+				expandedText,
+				{ ...options, images: retryNormalizedImages },
+				true,
+			);
+			if (!retryPreparation.created && this.#shouldShortCircuitHostTurnRetry(retryPreparation.operation)) {
+				options.onHostTurnPrepared?.();
+				return true;
+			}
+		}
 
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
