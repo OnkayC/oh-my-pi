@@ -30,6 +30,10 @@ import type {
 	ExtensionFactory,
 	ExtensionRunner,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import {
+	EXTENSION_HANDLER_TIMEOUT_MS,
+	testSetExtensionHandlerTimeoutMs,
+} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { type CreateAgentSessionOptions, createAgentSession, discoverAuthStorage } from "@oh-my-pi/pi-coding-agent/sdk";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { FileWriteFallbackRequest } from "@oh-my-pi/pi-coding-agent/tools/file-write-fallback";
@@ -146,6 +150,7 @@ describe("registerFileWriteFallback end-to-end (real extension, real session)", 
 	// EACCES, aborting this loop after `splice(0)` already emptied the list, which
 	// strands every remaining temp dir for the rest of the run.
 	afterEach(() => {
+		testSetExtensionHandlerTimeoutMs(EXTENSION_HANDLER_TIMEOUT_MS);
 		for (const dir of lockedDirs.splice(0)) {
 			try {
 				fs.chmodSync(dir, 0o700);
@@ -583,4 +588,47 @@ describe("registerFileWriteFallback end-to-end (real extension, real session)", 
 			}
 		},
 	);
+
+	itDenied("times out a hung write fallback and continues to the next handler", async () => {
+		const tempDir = makeTempDir();
+		const lockedDir = path.join(tempDir, "locked-timeout");
+		fs.mkdirSync(lockedDir, { recursive: true });
+		lock(lockedDir, 0o500);
+		const dest = path.join(lockedDir, "hung.txt");
+
+		let hungStarted = false;
+		let recovered = false;
+		const factory: ExtensionFactory = pi => {
+			pi.registerFileWriteFallback(async () => {
+				hungStarted = true;
+				await Promise.withResolvers<void>().promise;
+				return true;
+			});
+			pi.registerFileWriteFallback(async req => {
+				recovered = true;
+				fs.chmodSync(lockedDir, 0o700);
+				try {
+					fs.writeFileSync(req.dst, req.content);
+				} finally {
+					fs.chmodSync(lockedDir, 0o500);
+				}
+				return true;
+			});
+		};
+
+		testSetExtensionHandlerTimeoutMs(20);
+		const { session } = await createAgentSession(baseOptions(tempDir, [factory]));
+		initializeRunnerForTest(session.extensionRunner);
+		try {
+			const writeTool = session.getToolByName("write") as AgentTool | undefined;
+			const result = await writeTool!.execute("call-write-timeout", { path: dest, content: "recovered\n" });
+			expect(result.isError).not.toBe(true);
+			expect(hungStarted).toBe(true);
+			expect(recovered).toBe(true);
+			expect(fs.readFileSync(dest, "utf8")).toBe("recovered\n");
+		} finally {
+			fs.chmodSync(lockedDir, 0o700);
+			await session.dispose();
+		}
+	});
 });

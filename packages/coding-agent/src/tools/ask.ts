@@ -908,6 +908,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 							})),
 							...(q.multi !== undefined ? { multi: q.multi } : {}),
 							...(q.recommended !== undefined ? { recommended: q.recommended } : {}),
+							allowCustom: true,
 						})),
 						{ timeout: timeout ?? undefined, signal },
 					);

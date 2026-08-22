@@ -41,7 +41,7 @@ import {
 	resolveTelemetry,
 	type StreamFn,
 	TERMINAL_TOOL_RESULT_ABORT_REASON,
-	type ThinkingLevel,
+	ThinkingLevel,
 	type ToolChoiceDirective,
 } from "@oh-my-pi/pi-agent-core";
 import {
@@ -75,10 +75,11 @@ import type {
 	UsageReport,
 	UserMessage,
 } from "@oh-my-pi/pi-ai";
-import { type Effort, streamSimple } from "@oh-my-pi/pi-ai";
+import { type Effort, realizesPriorityServiceTier, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
+import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
@@ -185,6 +186,7 @@ import type { SecretObfuscator } from "../secrets/obfuscator";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
+	clampThinkingLevelToCeiling,
 	parseConfiguredThinkingLevel,
 	shouldDisableReasoning,
 	toReasoningEffort,
@@ -282,6 +284,16 @@ import {
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
 } from "./exit-diagnostics";
+import {
+	type HostTurnBoundary,
+	type HostTurnKind,
+	type HostTurnOperation,
+	type HostTurnOptions,
+	type HostTurnOutcome,
+	type HostTurnRollbackInput,
+	type HostTurnRollbackResult,
+	hostTurnOptionsEqual,
+} from "./host-turns";
 import { IrcBridge, type IrcBridgeHost } from "./irc-bridge";
 import {
 	buildLaunchCompletionBatchMessage,
@@ -403,8 +415,27 @@ const noOpUIContext: ExtensionUIContext = {
 
 type MessageEndPersistenceSlot = {
 	readonly promise: Promise<void>;
-	persist: (persistMessage: () => void) => Promise<void>;
+	persist: (persistMessage: () => void | Promise<void>) => Promise<void>;
 	release: () => void;
+};
+
+type PreparedHostTurnPayload = {
+	text: string;
+	images?: ImageContent[];
+	synthetic: boolean;
+	attribution?: "user" | "agent";
+};
+type DequeueRuntimeSnapshot = {
+	clientTurnId: string;
+	model: Model | undefined;
+	thinkingLevel: ConfiguredThinkingLevel | undefined;
+	fastMode: boolean;
+};
+
+type ResolvedHostTurnOptions = {
+	model: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+	fastMode?: boolean;
 };
 
 type PostPromptSkipReason = "aborted" | "stale-generation";
@@ -430,6 +461,10 @@ type SetSessionNameWithTrigger = (
 	source?: SessionTitleSource,
 	trigger?: SessionNameTrigger,
 ) => Promise<boolean>;
+const kPreparedHostTurnOperation = Symbol("preparedHostTurnOperation");
+type PreparedHostTurnPromptOptions = PromptOptions & {
+	[kPreparedHostTurnOperation]?: HostTurnOperation;
+};
 
 const kPersistedSessionEntryId = Symbol("persistedSessionEntryId");
 type PersistedAssistantMessage = AssistantMessage & { [kPersistedSessionEntryId]?: string };
@@ -618,6 +653,8 @@ export class AgentSession {
 	#modeExitDrainSuppressionDepth = 0;
 	#usagePreflightReadyForNextModelCall = false;
 	#usagePreflightReadyModel: Model | undefined;
+	#detachHostTurnBeforeQueueDequeue: (() => void) | undefined;
+	#detachHostTurnDequeueBarrier: (() => void) | undefined;
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
 
@@ -685,6 +722,29 @@ export class AgentSession {
 	#yieldTerminationPending = false;
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	/** Prepared follow-ups keyed by the exact runtime host message queued for promotion. */
+	#queuedHostTurns = new Map<AgentMessage, HostTurnOperation>();
+	/** Every contiguous companion/host message keyed to its durable dequeue barrier unit. */
+	#queuedHostTurnBarriers = new Map<AgentMessage, HostTurnOperation>();
+	#enqueuingPreparedHostTurns = new Set<string>();
+	/**
+	 * Direct (non-queued) durable prompts that have been prepared and are still between
+	 * preparation and host-turn dispatch commit. Concurrent identical retries short-circuit
+	 * against this set so a second pipeline does not start.
+	 */
+	#inflightPreparedHostTurns = new Set<string>();
+	/**
+	 * Runtime (model/thinking/fast-mode) captured before a dequeue turnOptions apply.
+	 * Restored when the dequeue never reaches host_turn_promoted / consumption.
+	 */
+	#dequeueRuntimeSnapshot: DequeueRuntimeSnapshot | undefined;
+	/** Follow-ups promoted into the current native run and awaiting terminal settle. */
+	#activeHostTurns = new Map<string, HostTurnOperation>();
+	/** Terminal result recorded for each promoted host turn before the run-level agent_end. */
+	#activeHostTurnOutcomes = new Map<string, HostTurnOutcome>();
+	/** Promoted host turn currently owning provider continuations until the next promotion. */
+	#currentActiveHostTurnId: string | undefined;
+	#preparedHostTurnRecovery: Promise<string[]> | undefined;
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
 	readonly #memory: SessionMemory;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
@@ -1137,6 +1197,32 @@ export class AgentSession {
 			withBashBranchTransition: operation => this.#bash.withBranchTransition(operation),
 		};
 		this.#recovery = new TurnRecovery(recoveryHost, { initialRetryFallback: config.initialRetryFallback });
+		this.#detachHostTurnDequeueBarrier = this.agent.addFollowUpDequeueBarrier(message =>
+			this.#queuedHostTurnBarriers.get(message),
+		);
+		this.#detachHostTurnBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (this.agent.peekSteeringQueue().length > 0) return;
+			const message = this.agent.peekFollowUpQueue()[0];
+			if (!message) return;
+			const operation = this.#queuedHostTurnBarriers.get(message);
+			if (!operation) return;
+			if (operation.turnOptions) {
+				signal?.throwIfAborted();
+				// Drop any uncommitted prior dequeue snapshot before applying new options.
+				await this.#restoreUncommittedDequeueRuntime();
+				const snapshot = this.#captureDequeueRuntimeSnapshot(operation.clientTurnId);
+				try {
+					await this.#applyHostTurnOptions(operation.turnOptions);
+					signal?.throwIfAborted();
+					this.#dequeueRuntimeSnapshot = snapshot;
+				} catch (error) {
+					await this.#restoreDequeueRuntimeSnapshot(snapshot).catch(() => undefined);
+					throw error;
+				}
+			}
+			this.#activeHostTurnOutcomes.delete(operation.clientTurnId);
+			this.#currentActiveHostTurnId = operation.clientTurnId;
+		});
 		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
 			if (
 				!this.settings.get("retry.usageAwareFallback") ||
@@ -1145,6 +1231,7 @@ export class AgentSession {
 				return;
 			}
 			if (!(await this.#runQueuedUsageAwarePreflight(signal))) {
+				await this.#restoreUncommittedDequeueRuntime();
 				signal?.throwIfAborted();
 				throw new DOMException("Usage preflight cancelled", "AbortError");
 			}
@@ -2217,6 +2304,7 @@ export class AgentSession {
 	 * the recovery wait always sees the in-flight handler and blocks until it — and
 	 * everything it schedules — settles. */
 	#dispatchAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "turn_end") this.#recordCurrentHostTurnOutcome(event.message as AssistantMessage);
 		if (event.type === "tool_execution_end" && this.#isTerminalYieldToolResult(event)) {
 			const alreadyTerminated = this.#synchronouslyTerminatedYieldToolCallIds.delete(event.toolCallId);
 			if (!alreadyTerminated) {
@@ -2245,19 +2333,19 @@ export class AgentSession {
 		if (!key) return undefined;
 		const previous = this.#messageEndPersistenceTail;
 		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#pendingMessageEndPersistence.set(key, promise);
 		const clear = () => {
 			if (this.#pendingMessageEndPersistence.get(key) === promise) {
 				this.#pendingMessageEndPersistence.delete(key);
 			}
 		};
-		this.#pendingMessageEndPersistence.set(key, promise);
 		this.#messageEndPersistenceTail = promise.catch(() => {});
 		return {
 			promise,
 			persist: async persistMessage => {
 				await previous;
 				try {
-					persistMessage();
+					await persistMessage();
 				} finally {
 					resolve();
 					clear();
@@ -2432,7 +2520,7 @@ export class AgentSession {
 		};
 	}
 
-	#persistMessageEnd(message: AgentMessage): void {
+	async #persistMessageEnd(message: AgentMessage): Promise<void> {
 		if (message.role === "hookMessage" || message.role === "custom") {
 			// Prewalk's plan nudge is a one-run steering instruction. Persisting it would
 			// resurrect the consumed prompt on resume, fork, or any context rebuild.
@@ -2450,7 +2538,442 @@ export class AgentSession {
 			}
 			return;
 		}
-		this.#persistSessionMessageIfMissing(message);
+		if (!(await this.#persistPromotedHostTurnMessage(message))) {
+			this.#persistSessionMessageIfMissing(message);
+		}
+	}
+
+	#findPersistedSessionMessageEntryId(message: AgentMessage): string | undefined {
+		const key = sessionMessagePersistenceKey(message);
+		if (key === undefined) return undefined;
+		const branch = this.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type !== "message") continue;
+			if (sessionMessagePersistenceKey(entry.message) !== key) continue;
+			if (sameMessageContent(entry.message, message)) return entry.id;
+		}
+		return undefined;
+	}
+
+	#hostTurnPayload(text: string, options: Pick<PromptOptions, "synthetic" | "attribution" | "images">): unknown {
+		return {
+			text,
+			synthetic: options.synthetic === true,
+			attribution: options.attribution,
+			images: options.images,
+		};
+	}
+
+	async #prepareHostTurn(
+		clientTurnId: string,
+		kind: HostTurnKind,
+		text: string,
+		options: Pick<PromptOptions, "synthetic" | "attribution" | "images"> & {
+			optionFingerprint?: string;
+			turnOptions?: HostTurnOptions;
+		},
+		optionsValidated = false,
+	): Promise<{ operation: HostTurnOperation; created: boolean }> {
+		if (options.turnOptions && !optionsValidated) await this.#resolveHostTurnOptions(options.turnOptions);
+		const existing = this.sessionManager
+			.getHostTurnOperations()
+			.find(operation => operation.clientTurnId === clientTurnId);
+		if (existing && !hostTurnOptionsEqual(existing.turnOptions, options.turnOptions)) {
+			throw new Error(`Host turn ${clientTurnId}: clientTurnId already exists with different turn options`);
+		}
+		return await this.sessionManager.prepareHostTurnOperationWithStatus({
+			clientTurnId,
+			kind,
+			payload: this.#hostTurnPayload(text, options),
+			optionFingerprint: options.optionFingerprint,
+			turnOptions: options.turnOptions,
+		});
+	}
+
+	/**
+	 * Idempotent retries short-circuit only after a host turn has already been
+	 * dispatched/settled, or while an identical prepared turn is still queued /
+	 * enqueuing / in the non-streaming prepared window before dispatch commit.
+	 * Prepared-but-failed operations must redispatch on the same clientTurnId.
+	 */
+	#shouldShortCircuitHostTurnRetry(operation: HostTurnOperation): boolean {
+		if (operation.status !== "prepared") return true;
+		for (const candidate of this.#queuedHostTurns.values()) {
+			if (candidate.clientTurnId === operation.clientTurnId) return true;
+		}
+		return (
+			this.#enqueuingPreparedHostTurns.has(operation.clientTurnId) ||
+			this.#inflightPreparedHostTurns.has(operation.clientTurnId)
+		);
+	}
+
+	#trackQueuedHostTurn(message: AgentMessage, operation: HostTurnOperation): void {
+		this.#queuedHostTurns.set(message, operation);
+		this.#queuedHostTurnBarriers.set(message, operation);
+	}
+
+	#trackQueuedHostTurnCompanion(message: AgentMessage, operation: HostTurnOperation): void {
+		this.#queuedHostTurnBarriers.set(message, operation);
+	}
+
+	#clearQueuedHostTurnBarrier(operation: HostTurnOperation): void {
+		for (const [message, candidate] of this.#queuedHostTurnBarriers) {
+			if (candidate.clientTurnId === operation.clientTurnId) this.#queuedHostTurnBarriers.delete(message);
+		}
+	}
+
+	#clearHostTurnRuntimeTracking(): void {
+		this.#queuedHostTurns.clear();
+		this.#queuedHostTurnBarriers.clear();
+		this.#enqueuingPreparedHostTurns.clear();
+		this.#inflightPreparedHostTurns.clear();
+		this.#dequeueRuntimeSnapshot = undefined;
+		this.#activeHostTurns.clear();
+		this.#activeHostTurnOutcomes.clear();
+		this.#currentActiveHostTurnId = undefined;
+		this.#preparedHostTurnRecovery = undefined;
+	}
+
+	#captureDequeueRuntimeSnapshot(clientTurnId: string): DequeueRuntimeSnapshot {
+		return {
+			clientTurnId,
+			model: this.model,
+			thinkingLevel: this.configuredThinkingLevel(),
+			fastMode: this.isFastModeActive(),
+		};
+	}
+
+	async #restoreDequeueRuntimeSnapshot(snapshot: DequeueRuntimeSnapshot): Promise<void> {
+		if (snapshot.model) {
+			if (!this.model || !modelsAreEqual(this.model, snapshot.model)) {
+				await this.setModel(snapshot.model);
+			}
+		}
+		// Always restore, including undefined: a dequeue-applied thinking level must
+		// not survive when the pre-dequeue session had no configured level.
+		if (this.configuredThinkingLevel() !== snapshot.thinkingLevel) {
+			this.setThinkingLevel(snapshot.thinkingLevel);
+		}
+		if (this.isFastModeActive() !== snapshot.fastMode) {
+			this.setFastMode(snapshot.fastMode);
+		}
+	}
+
+	/** Restore runtime when a dequeue applied turnOptions without reaching promotion. */
+	async #restoreUncommittedDequeueRuntime(): Promise<void> {
+		const snapshot = this.#dequeueRuntimeSnapshot;
+		if (!snapshot) return;
+		// Successful promotion moves the turn into activeHostTurns; leave applied options.
+		if (this.#activeHostTurns.has(snapshot.clientTurnId)) {
+			this.#dequeueRuntimeSnapshot = undefined;
+			return;
+		}
+		this.#dequeueRuntimeSnapshot = undefined;
+		await this.#restoreDequeueRuntimeSnapshot(snapshot).catch(() => undefined);
+		if (this.#currentActiveHostTurnId === snapshot.clientTurnId) {
+			this.#currentActiveHostTurnId = undefined;
+		}
+	}
+
+	#parsePreparedHostTurnPayload(operation: HostTurnOperation): PreparedHostTurnPayload {
+		if (!isRecord(operation.payload) || typeof operation.payload.text !== "string") {
+			throw new Error(`Host turn ${operation.clientTurnId}: prepared payload cannot be recovered`);
+		}
+		const rawImages = operation.payload.images;
+		let images: ImageContent[] | undefined;
+		if (rawImages !== undefined) {
+			if (!Array.isArray(rawImages)) throw new Error(`Host turn ${operation.clientTurnId}: images are invalid`);
+			images = rawImages.map(image => {
+				if (
+					!isRecord(image) ||
+					image.type !== "image" ||
+					typeof image.mimeType !== "string" ||
+					typeof image.data !== "string"
+				) {
+					throw new Error(`Host turn ${operation.clientTurnId}: image payload is invalid`);
+				}
+				return { type: "image", mimeType: image.mimeType, data: image.data };
+			});
+		}
+		const attribution =
+			operation.payload.attribution === "user" || operation.payload.attribution === "agent"
+				? operation.payload.attribution
+				: undefined;
+		return {
+			text: operation.payload.text,
+			images,
+			synthetic: operation.payload.synthetic === true,
+			attribution,
+		};
+	}
+
+	async #commitHostTurnDispatch(message: Message, operation: HostTurnOperation): Promise<HostTurnOperation> {
+		return await this.sessionManager.appendEntriesAtomically(() => {
+			const entryId = this.#findPersistedSessionMessageEntryId(message) ?? this.#appendSessionMessage(message);
+			return this.sessionManager.recordHostTurnDispatched({
+				clientTurnId: operation.clientTurnId,
+				payloadFingerprint: operation.payloadFingerprint,
+				nativeIdentity: {
+					sessionId: this.sessionId,
+					sessionFile: this.sessionFile,
+					entryId,
+				},
+			});
+		});
+	}
+	async #persistPromotedHostTurnMessage(message: AgentMessage): Promise<boolean> {
+		if (message.role !== "user" && message.role !== "developer") return false;
+		const operation = this.#queuedHostTurns.get(message);
+		if (!operation) return false;
+		const dispatched = await this.#commitHostTurnDispatch(message, operation);
+		this.#queuedHostTurns.delete(message);
+		this.#clearQueuedHostTurnBarrier(operation);
+		this.#activeHostTurns.set(dispatched.clientTurnId, dispatched);
+		// Options from this dequeue are now committed with the promoted turn.
+		if (this.#dequeueRuntimeSnapshot?.clientTurnId === operation.clientTurnId) {
+			this.#dequeueRuntimeSnapshot = undefined;
+		}
+		if (operation.optionFingerprint) {
+			const currentModel = this.model;
+			const modelString = currentModel ? `${currentModel.provider}/${currentModel.id}` : "";
+			void this.#emitSessionEvent({
+				type: "host_turn_promoted",
+				clientTurnId: operation.clientTurnId,
+				optionFingerprint: operation.optionFingerprint,
+				model: modelString,
+				thinkingLevel: this.configuredThinkingLevel(),
+				fastMode: this.isFastModeActive(),
+			});
+		}
+		return true;
+	}
+
+	async #resolveHostTurnOptions(options: HostTurnOptions): Promise<ResolvedHostTurnOptions> {
+		for (const key of Object.keys(options)) {
+			if (key !== "provider" && key !== "modelId" && key !== "thinkingLevel" && key !== "fastMode") {
+				throw new Error(`Unsupported host-turn option ${key}`);
+			}
+		}
+		const matches = this.getAvailableModels().filter(
+			model =>
+				model.id === options.modelId && (options.provider === undefined || model.provider === options.provider),
+		);
+		const requestedModel = options.provider ? `${options.provider}/${options.modelId}` : options.modelId;
+		if (matches.length === 0) throw new Error(`Unavailable host-turn model ${requestedModel}`);
+		if (matches.length > 1) throw new Error(`Ambiguous host-turn model ${requestedModel}; provider is required`);
+		const selectedModel = matches[0]!;
+		if (!this.#modelRegistry.hasConfiguredAuth(selectedModel)) {
+			throw new Error(
+				`Unavailable host-turn model ${selectedModel.provider}/${selectedModel.id}: no configured credentials`,
+			);
+		}
+		const model = await this.#modelRegistry.refreshSelectedModelMetadata(selectedModel);
+
+		let thinkingLevel: ConfiguredThinkingLevel | undefined;
+		if (options.thinkingLevel !== undefined) {
+			thinkingLevel = parseConfiguredThinkingLevel(options.thinkingLevel);
+			if (thinkingLevel === undefined) {
+				throw new Error(`Invalid host-turn thinking level ${options.thinkingLevel}`);
+			}
+			const supportedEfforts = getSupportedEfforts(model);
+			const unsupported =
+				thinkingLevel === AUTO_THINKING
+					? supportedEfforts.length === 0
+					: thinkingLevel !== ThinkingLevel.Off &&
+						(!supportedEfforts.includes(thinkingLevel as Effort) ||
+							clampThinkingLevelToCeiling(model, thinkingLevel as Effort, this.#models.thinkingLevelCeiling) !==
+								thinkingLevel);
+			if (unsupported) {
+				throw new Error(
+					`Host-turn thinking level ${options.thinkingLevel} is unsupported by ${model.provider}/${model.id}`,
+				);
+			}
+		}
+
+		if (options.fastMode === true && !realizesPriorityServiceTier("priority", model)) {
+			throw new Error(`Host-turn fast mode is unsupported by ${model.provider}/${model.id}`);
+		}
+		return { model, thinkingLevel, fastMode: options.fastMode };
+	}
+
+	async #applyHostTurnOptions(options: HostTurnOptions): Promise<void> {
+		const resolved = await this.#resolveHostTurnOptions(options);
+		await this.setModel(resolved.model);
+		if (!this.model || !modelsAreEqual(this.model, resolved.model)) {
+			throw new Error(`Host-turn model ${resolved.model.provider}/${resolved.model.id} was not applied`);
+		}
+		if (resolved.thinkingLevel !== undefined) {
+			this.setThinkingLevel(resolved.thinkingLevel);
+			if (this.configuredThinkingLevel() !== resolved.thinkingLevel) {
+				throw new Error(`Host-turn thinking level ${resolved.thinkingLevel} was not applied`);
+			}
+		}
+		if (resolved.fastMode !== undefined) {
+			const supported = this.setFastMode(resolved.fastMode);
+			if ((resolved.fastMode && !supported) || this.isFastModeActive() !== resolved.fastMode) {
+				throw new Error(`Host-turn fast mode ${resolved.fastMode ? "on" : "off"} was not applied`);
+			}
+		}
+	}
+
+	/**
+	 * Drop matching durable follow-up units (and their hidden companions) from the
+	 * agent follow-up queue so cancelled/rolled-back host turns cannot still drain.
+	 */
+	#removeHostTurnsFromFollowUpQueue(clientTurnIds: ReadonlySet<string>): void {
+		if (clientTurnIds.size === 0) return;
+		const messagesToRemove = new Set<AgentMessage>();
+		for (const [message, operation] of this.#queuedHostTurns) {
+			if (clientTurnIds.has(operation.clientTurnId)) messagesToRemove.add(message);
+		}
+		if (messagesToRemove.size === 0) return;
+
+		const followUp = this.agent.peekFollowUpQueue().slice();
+		for (let index = followUp.length - 1; index >= 0; index--) {
+			if (!messagesToRemove.has(followUp[index]!)) continue;
+			let start = index;
+			while (start > 0 && isHiddenUserCompanion(followUp[start - 1]!)) start--;
+			followUp.splice(start, index - start + 1);
+			index = start;
+		}
+		this.agent.replaceQueues([...this.agent.peekSteeringQueue()], followUp);
+		this.#reconcileQueuedMessageDrain();
+	}
+
+	async #cancelQueuedHostTurns(reason?: string, onlyClientTurnIds?: ReadonlySet<string>): Promise<void> {
+		const queued = [...this.#queuedHostTurns.entries()].filter(
+			([, operation]) => !onlyClientTurnIds || onlyClientTurnIds.has(operation.clientTurnId),
+		);
+		if (queued.length === 0) return;
+
+		const cancelledIds = new Set(queued.map(([, operation]) => operation.clientTurnId));
+		this.#removeHostTurnsFromFollowUpQueue(cancelledIds);
+
+		if (!onlyClientTurnIds) {
+			this.#queuedHostTurns.clear();
+			this.#queuedHostTurnBarriers.clear();
+		}
+		for (const [message, operation] of queued) {
+			if (onlyClientTurnIds) {
+				this.#queuedHostTurns.delete(message);
+				this.#queuedHostTurnBarriers.delete(message);
+				this.#clearQueuedHostTurnBarrier(operation);
+			}
+			await this.sessionManager.cancelPreparedHostTurnOperation({
+				clientTurnId: operation.clientTurnId,
+				payloadFingerprint: operation.payloadFingerprint,
+				outcome: "cancelled",
+			});
+			void this.#emitSessionEvent({
+				type: "host_turn_cancelled",
+				clientTurnId: operation.clientTurnId,
+				outcome: "cancelled",
+				...(reason ? { reason } : {}),
+			});
+		}
+	}
+
+	/**
+	 * Cancel one prepared durable host turn still waiting in the follow-up queue
+	 * (or mid-enqueue). Direct durable `prompt`s that are prepared but not owned by
+	 * the follow-up path are intentionally not cancellable here.
+	 * Returns false when the turn is unknown, not queue-owned, or already promoted/settled.
+	 */
+	async cancelQueuedHostTurn(clientTurnId: string): Promise<boolean> {
+		const trimmed = clientTurnId.trim();
+		if (!trimmed) return false;
+		const queued = [...this.#queuedHostTurns.entries()].find(([, operation]) => operation.clientTurnId === trimmed);
+		if (queued) {
+			if (this.#dequeueRuntimeSnapshot?.clientTurnId === trimmed) {
+				await this.#restoreUncommittedDequeueRuntime();
+			}
+			await this.#cancelQueuedHostTurns("cancelled", new Set([trimmed]));
+			return true;
+		}
+
+		// In-progress enqueue of a prepared follow-up (followUpPreparedHostTurn window).
+		if (this.#enqueuingPreparedHostTurns.has(trimmed)) {
+			const prepared = this.sessionManager
+				.getHostTurnOperations()
+				.find(operation => operation.clientTurnId === trimmed && operation.status === "prepared");
+			if (!prepared) return false;
+			await this.sessionManager.cancelPreparedHostTurnOperation({
+				clientTurnId: prepared.clientTurnId,
+				payloadFingerprint: prepared.payloadFingerprint,
+				outcome: "cancelled",
+			});
+			void this.#emitSessionEvent({
+				type: "host_turn_cancelled",
+				clientTurnId: prepared.clientTurnId,
+				outcome: "cancelled",
+				reason: "cancelled",
+			});
+			return true;
+		}
+
+		// Prepared non-queued prompts (direct prompt path) and orphaned prepared
+		// journal rows are not cancel_follow_up targets.
+		return false;
+	}
+
+	async #cancelQueuedHostTurnForMessage(message: AgentMessage, reason?: string): Promise<void> {
+		const operation = this.#queuedHostTurns.get(message);
+		this.#queuedHostTurnBarriers.delete(message);
+		if (!operation) return;
+		this.#queuedHostTurns.delete(message);
+		this.#clearQueuedHostTurnBarrier(operation);
+		await this.sessionManager.cancelPreparedHostTurnOperation({
+			clientTurnId: operation.clientTurnId,
+			payloadFingerprint: operation.payloadFingerprint,
+			outcome: "cancelled",
+		});
+		void this.#emitSessionEvent({
+			type: "host_turn_cancelled",
+			clientTurnId: operation.clientTurnId,
+			outcome: "cancelled",
+			...(reason ? { reason } : {}),
+		});
+	}
+	async #settleHostTurn(operation: HostTurnOperation, outcome: HostTurnOutcome): Promise<void> {
+		const current = this.sessionManager
+			.getHostTurnOperations()
+			.find(candidate => candidate.clientTurnId === operation.clientTurnId);
+		if (current?.status !== "dispatched") return;
+		await this.sessionManager.settleHostTurnOperation({
+			clientTurnId: current.clientTurnId,
+			payloadFingerprint: current.payloadFingerprint,
+			outcome,
+		});
+	}
+
+	#hostTurnOutcomeForAssistant(message: AssistantMessage | undefined): HostTurnOutcome {
+		return message?.stopReason === "aborted"
+			? "aborted"
+			: message?.stopReason === "error" || message === undefined
+				? "failed"
+				: "completed";
+	}
+
+	#recordCurrentHostTurnOutcome(message: AssistantMessage): void {
+		const clientTurnId = this.#currentActiveHostTurnId;
+		if (!clientTurnId) return;
+		this.#activeHostTurnOutcomes.set(clientTurnId, this.#hostTurnOutcomeForAssistant(message));
+	}
+
+	async #settlePromotedHostTurns(fallbackOutcome: HostTurnOutcome): Promise<void> {
+		const promoted = [...this.#activeHostTurns.values()];
+		const outcomes = this.#activeHostTurnOutcomes;
+		const currentClientTurnId = this.#currentActiveHostTurnId;
+		this.#activeHostTurns.clear();
+		this.#activeHostTurnOutcomes = new Map();
+		this.#currentActiveHostTurnId = undefined;
+		for (const operation of promoted) {
+			const outcome =
+				outcomes.get(operation.clientTurnId) ??
+				(operation.clientTurnId === currentClientTurnId ? fallbackOutcome : "failed");
+			await this.#settleHostTurn(operation, outcome);
+		}
 	}
 
 	/**
@@ -2659,7 +3182,7 @@ export class AgentSession {
 					const persistMessageEnd = () => this.#persistMessageEnd(event.message);
 					try {
 						if (messageEndPersistence) await messageEndPersistence.persist(persistMessageEnd);
-						else persistMessageEnd();
+						else await persistMessageEnd();
 					} catch (persistenceError) {
 						logger.warn("Failed to persist message after session event emission failed", {
 							error: String(persistenceError),
@@ -2674,7 +3197,6 @@ export class AgentSession {
 			this.#streamingEditGuard.reset();
 			this.#ttsr.onTurnStart();
 		}
-
 		if (event.type === "turn_end") this.#ttsr.onTurnEnd();
 		// Finalize the tool-choice queue's in-flight yield after tools have executed.
 		// This must happen at turn_end (not message_end) because onInvoked handlers
@@ -2727,7 +3249,7 @@ export class AgentSession {
 			if (messageEndPersistence) {
 				await messageEndPersistence.persist(persistMessageEnd);
 			} else {
-				persistMessageEnd();
+				await persistMessageEnd();
 			}
 			if (interruptedThinkingMessage) {
 				this.sessionManager.appendCustomMessageEntry(
@@ -2867,6 +3389,14 @@ export class AgentSession {
 				// Public agent_end is held out of the eager display pass and emitted
 				// here after maintenance routing, tagged isTerminal so subscribers can
 				// tell final settles from scheduled continuations.
+				await this.#messageEndPersistenceTail;
+				if (!options?.willContinue && this.#activeHostTurns.size > 0) {
+					const terminal = [...settledMessages]
+						.reverse()
+						.find((message): message is AssistantMessage => message.role === "assistant");
+					const outcome = this.#hostTurnOutcomeForAssistant(terminal);
+					await this.#settlePromotedHostTurns(outcome);
+				}
 				await this.#emitSessionEvent({ ...event, isTerminal: !options?.willContinue });
 				void this.#emitAgentEndNotification([...activeMessages], options).catch(err => {
 					logger.error("Agent end extension notification failed", { err });
@@ -3279,6 +3809,8 @@ export class AgentSession {
 					options?.onError?.(error);
 				} finally {
 					this.#usagePreflightReadyForNextModelCall = false;
+					// Dequeue may have applied turnOptions without promoting (abort/preflight fail).
+					await this.#restoreUncommittedDequeueRuntime();
 					this.#endInFlight();
 				}
 			},
@@ -3931,6 +4463,10 @@ export class AgentSession {
 		this.#isDisposed = true;
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
+		this.#detachHostTurnDequeueBarrier?.();
+		this.#detachHostTurnDequeueBarrier = undefined;
+		this.#detachHostTurnBeforeQueueDequeue?.();
+		this.#detachHostTurnBeforeQueueDequeue = undefined;
 		this.#detachUsageBeforeQueueDequeue?.();
 		this.#detachUsageBeforeQueueDequeue = undefined;
 		this.#detachUsageBeforeModelCall?.();
@@ -4460,6 +4996,11 @@ export class AgentSession {
 		return this.#models.thinkingLevel;
 	}
 
+	/** Hard per-session effort ceiling every thinking-level change is clamped to. */
+	get thinkingLevelCeiling(): Effort | undefined {
+		return this.#models.thinkingLevelCeiling;
+	}
+
 	/** The selector the user configured: `auto` when auto mode is active, else the effective level. */
 	configuredThinkingLevel(): ConfiguredThinkingLevel | undefined {
 		return this.#models.configuredThinkingLevel();
@@ -4494,6 +5035,23 @@ export class AgentSession {
 		await this.agent.waitForIdle();
 		await this.#advisors.waitForPendingCardEvents();
 		await this.#waitForPostPromptRecovery();
+	}
+
+	/** Resume a turn whose user-authored message is already present in the persisted transcript. */
+	async resumePersistedTurn(): Promise<void> {
+		if (this.isStreaming) throw new AgentBusyError();
+		this.#beginInFlight();
+		const generation = this.#promptGeneration;
+		try {
+			await this.#recovery.maybeRestoreRetryFallbackPrimary();
+			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return;
+			this.#resetPromptMaintenanceState();
+			await this.agent.continue();
+			await this.#waitForPostPromptRecovery(generation);
+		} finally {
+			this.#usagePreflightReadyForNextModelCall = false;
+			this.#endInFlight();
+		}
 	}
 	/**
 	 * Prevent advisor notes from starting hidden primary turns while a headless
@@ -4941,6 +5499,201 @@ export class AgentSession {
 	get sessionId(): string {
 		return this.#activeProviderSessionId();
 	}
+
+	/** Chronological durable host-owned turn boundaries, including parent lineage. */
+	getHostTurns(): Promise<HostTurnBoundary[]> {
+		return this.sessionManager.getHostTurns();
+	}
+
+	/** Redispatch prepared ordinary/follow-up operations that never acquired a native identity. */
+	recoverPreparedHostTurns(): Promise<string[]> {
+		if (this.#preparedHostTurnRecovery) return this.#preparedHostTurnRecovery;
+		const recovery = this.#recoverPreparedHostTurns();
+		this.#preparedHostTurnRecovery = recovery;
+		const clear = () => {
+			if (this.#preparedHostTurnRecovery === recovery) this.#preparedHostTurnRecovery = undefined;
+		};
+		void recovery.then(clear, clear);
+		return recovery;
+	}
+
+	async #recoverPreparedHostTurns(onlyClientTurnId?: string): Promise<string[]> {
+		if (this.isStreaming || this.isBashRunning || this.isEvalRunning || this.isCompacting || this.isRetrying) {
+			throw new AgentBusyError();
+		}
+		const recovered: string[] = [];
+		for (const operation of this.sessionManager.getHostTurnOperations()) {
+			if (onlyClientTurnId && operation.clientTurnId !== onlyClientTurnId) continue;
+			if (operation.status !== "prepared" || (operation.kind !== "prompt" && operation.kind !== "follow_up"))
+				continue;
+			// Special durable RPC commands are restored by their dedicated dispatchers.
+			if (
+				isRecord(operation.payload) &&
+				(isRecord(operation.payload.rpcBuiltin) || isRecord(operation.payload.rpcSkill))
+			) {
+				continue;
+			}
+			const payload = this.#parsePreparedHostTurnPayload(operation);
+			// Recovery bypasses the dequeue hook where turnOptions are normally applied;
+			// apply them here so the restored prompt runs with the acknowledged runtime.
+			if (operation.turnOptions) {
+				await this.#applyHostTurnOptions(operation.turnOptions);
+			}
+			const options: PreparedHostTurnPromptOptions = {
+				images: payload.images,
+				synthetic: payload.synthetic,
+				attribution: payload.attribution,
+				expandPromptTemplates: false,
+				clientTurnId: operation.clientTurnId,
+				hostTurnKind: operation.kind,
+				...(operation.turnOptions ? { turnOptions: operation.turnOptions } : {}),
+				[kPreparedHostTurnOperation]: operation,
+			};
+			await this.prompt(payload.text, options);
+			recovered.push(operation.clientTurnId);
+			if (onlyClientTurnId) break;
+		}
+		return recovered;
+	}
+
+	/** Recover one prepared ordinary/follow-up host turn by clientTurnId (journal-order recovery). */
+	async recoverPreparedHostTurn(clientTurnId: string): Promise<string | undefined> {
+		const recovered = await this.#recoverPreparedHostTurns(clientTurnId);
+		return recovered[0];
+	}
+	/**
+	 * Validate a host-turn rollback without mutating session or plan runtime.
+	 * Busy and suffix checks run here so callers (e.g. RPC) can refuse before
+	 * suspending plan mode.
+	 */
+	async validateHostTurnRollback(input: HostTurnRollbackInput): Promise<void> {
+		if (
+			this.isStreaming ||
+			this.isBashRunning ||
+			this.isEvalRunning ||
+			this.isCompacting ||
+			this.isGeneratingHandoff ||
+			this.isRetrying
+		) {
+			throw new AgentBusyError();
+		}
+		await this.sessionManager.validateHostTurnRollback(input);
+	}
+
+	/** Atomically remove the exact host-turn suffix and rebuild live session state. */
+	async rollbackHostTurns(input: HostTurnRollbackInput): Promise<HostTurnRollbackResult> {
+		await this.validateHostTurnRollback(input);
+		// Drop matching agent-queue units first, but do not settle prepared host-turn
+		// journal rows here — rollback truncates those entries. Settling first would
+		// change the suffix and make the second plan pass fail.
+		const suffixIds = new Set(input.expectedClientTurnIds);
+		const queuedInSuffix = [...this.#queuedHostTurns.entries()].filter(([, operation]) =>
+			suffixIds.has(operation.clientTurnId),
+		);
+		if (queuedInSuffix.length > 0) {
+			this.#removeHostTurnsFromFollowUpQueue(new Set(queuedInSuffix.map(([, operation]) => operation.clientTurnId)));
+			for (const [message, operation] of queuedInSuffix) {
+				this.#queuedHostTurns.delete(message);
+				this.#queuedHostTurnBarriers.delete(message);
+				this.#clearQueuedHostTurnBarrier(operation);
+			}
+		}
+		const result = await this.sessionManager.rollbackHostTurns(input);
+		for (const [, operation] of queuedInSuffix) {
+			void this.#emitSessionEvent({
+				type: "host_turn_cancelled",
+				clientTurnId: operation.clientTurnId,
+				outcome: "cancelled",
+				reason: "rollback",
+			});
+		}
+		this.#activeHostTurns.clear();
+		this.#activeHostTurnOutcomes.clear();
+		this.#currentActiveHostTurnId = undefined;
+		this.#clearSessionScopedToolState();
+		this.#rehydrateCheckpointRewindState();
+		this.#todo.syncFromBranch();
+		this.#freshProviderSessionId = undefined;
+		this.#syncAgentSessionId();
+		this.#memory.rekeyForCurrentSessionId();
+		await this.#memory.resetContextForNewTranscript();
+
+		// Rebuild messages and rehydrate model/thinking/service-tier from the
+		// resulting branch, matching switchSession's same-session reload path.
+		// Host-turn option application can leave live runtime state ahead of the
+		// truncated journal; without this restore the next turn keeps the rolled
+		// back model settings.
+		let sessionContext = this.buildDisplaySessionContext();
+		this.agent.replaceMessages(sessionContext.messages);
+
+		const targetModelStrings = getRestorableSessionModels(
+			sessionContext.models,
+			this.sessionManager.getLastModelChangeRole(),
+		);
+		if (targetModelStrings.length > 0) {
+			const availableModels = this.#modelRegistry.getAvailable();
+			let match: Model | undefined;
+			for (const targetModelStr of targetModelStrings) {
+				const slashIdx = targetModelStr.indexOf("/");
+				if (slashIdx <= 0) continue;
+				const provider = targetModelStr.slice(0, slashIdx);
+				const modelId = targetModelStr.slice(slashIdx + 1);
+				match = availableModels.find(m => m.provider === provider && m.id === modelId);
+				if (match) break;
+			}
+			if (match) {
+				const currentModel = this.model;
+				const shouldResetProviderState =
+					currentModel !== undefined &&
+					(currentModel.provider !== match.provider ||
+						currentModel.id !== match.id ||
+						currentModel.api !== match.api);
+				if (shouldResetProviderState) {
+					await this.#setModelWithProviderSessionReset(match);
+				} else {
+					this.agent.setModel(match);
+				}
+			}
+		}
+
+		const model = this.model;
+		if (model) {
+			const interruptedTurnAbort = createInterruptedTurnAbortMessage(this.sessionManager.getBranch(), {
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+			});
+			if (interruptedTurnAbort) {
+				this.sessionManager.appendMessage(interruptedTurnAbort);
+				sessionContext = this.buildDisplaySessionContext();
+				this.agent.replaceMessages(sessionContext.messages);
+			}
+		}
+
+		const hasThinkingEntry = this.sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
+		const hasServiceTierEntry = this.sessionManager.getBranch().some(entry => entry.type === "service_tier_change");
+		const defaultThinkingLevel = parseConfiguredThinkingLevel(this.settings.get("defaultThinkingLevel"));
+		const configuredServiceTierByFamily = buildServiceTierByFamily(
+			this.settings.get("tier.openai"),
+			this.settings.get("tier.anthropic"),
+			this.settings.get("tier.google"),
+		);
+		const restoredConfigured = sessionContext.configuredThinkingLevel;
+		const restoredThinkingLevel: ConfiguredThinkingLevel | undefined =
+			hasThinkingEntry || (defaultThinkingLevel === AUTO_THINKING && sessionContext.thinkingLevel !== "off")
+				? restoredConfigured === AUTO_THINKING
+					? AUTO_THINKING
+					: (sessionContext.thinkingLevel as ThinkingLevel | undefined)
+				: defaultThinkingLevel;
+		this.#models.restoreThinkingLevel(restoredThinkingLevel);
+		this.#models.restoreServiceTiers(
+			hasServiceTierEntry ? (sessionContext.serviceTier ?? {}) : configuredServiceTierByFamily,
+		);
+
+		this.#advisors.resetSessionState({ preserveCost: true });
+		this.#closeCodexProviderSessionsForHistoryRewrite();
+		return result;
+	}
 	getEvalSessionId(): string | null {
 		return this.#eval.getSessionId();
 	}
@@ -5351,15 +6104,19 @@ export class AgentSession {
 		});
 	}
 
-	#normalizeImagesForModel(images: ImageContent[] | undefined): Promise<ImageContent[] | undefined> {
-		return normalizeModelContextImages(images, { model: this.model });
+	#normalizeImagesForModel(
+		images: ImageContent[] | undefined,
+		model: Model | undefined = this.model,
+	): Promise<ImageContent[] | undefined> {
+		return normalizeModelContextImages(images, { model });
 	}
 
 	#buildImageDescriptionNotice(
 		normalizedImages: ImageContent[],
 		signal?: AbortSignal,
+		model?: Model,
 	): Promise<CustomMessage | undefined> {
-		return this.#providerBoundary.buildImageDescriptionNotice(normalizedImages, signal);
+		return this.#providerBoundary.buildImageDescriptionNotice(normalizedImages, signal, model);
 	}
 
 	#normalizeAgentMessageImages<T extends AgentMessage>(message: T): Promise<T> {
@@ -5441,6 +6198,23 @@ export class AgentSession {
 		// so a dropped prompt is handed back exactly as the user typed it.
 		const typedText = text;
 
+		// Durable identity requires idempotent preparation before local handlers mutate
+		// state. Extension/custom commands run before host-turn preparation, so reject
+		// them under clientTurnId rather than executing non-retry-safe side effects.
+		if (options?.clientTurnId && expandPromptTemplates && text.startsWith("/")) {
+			const spaceIndex = text.indexOf(" ");
+			const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
+			if (this.#extensionRunner?.getCommand(commandName)) {
+				throw new Error(`/${commandName} extension command cannot be retried safely with clientTurnId`);
+			}
+			if (
+				this.#customCommands.some(command => command.command.name === commandName) ||
+				this.#mcpPromptCommands.some(command => command.command.name === commandName)
+			) {
+				throw new Error(`/${commandName} custom command cannot be retried safely with clientTurnId`);
+			}
+		}
+
 		// Handle extension commands first (execute immediately, even during streaming)
 		if (expandPromptTemplates && text.startsWith("/")) {
 			const handled = await this.#tryExecuteExtensionCommand(text);
@@ -5466,6 +6240,20 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		const preparedHostTurn = (options as PreparedHostTurnPromptOptions | undefined)?.[kPreparedHostTurnOperation];
+		if (
+			preparedHostTurn &&
+			(preparedHostTurn.status !== "prepared" || preparedHostTurn.clientTurnId !== options?.clientTurnId)
+		) {
+			throw new Error("Recovered host turn does not match the prepared prompt operation");
+		}
+		if (options?.turnOptions) {
+			if (!options.clientTurnId) throw new Error("turnOptions require a durable clientTurnId");
+			await this.#resolveHostTurnOptions(options.turnOptions);
+		}
+		if (preparedHostTurn?.turnOptions && preparedHostTurn.turnOptions !== options?.turnOptions) {
+			await this.#resolveHostTurnOptions(preparedHostTurn.turnOptions);
+		}
 
 		// Magic keywords ("ultrathink", "orchestrate"): append hidden system notices after the
 		// user's message that steer this turn. User-authored prompts only — synthetic /
@@ -5488,16 +6276,58 @@ export class AgentSession {
 		if (this.isStreaming) {
 			const streamingBehavior = options?.streamingBehavior;
 			if (!streamingBehavior) throw new AgentBusyError();
+			if (options?.clientTurnId && streamingBehavior !== "followUp") {
+				throw new Error("clientTurnId is valid only for a queued follow-up while streaming");
+			}
+			// Normalize images before host-turn preparation so the durable fingerprint
+			// matches the queued message (same path as the idle prompt branch).
+			const streamingImagePrepModel = options?.turnOptions
+				? (await this.#resolveHostTurnOptions(options.turnOptions)).model
+				: preparedHostTurn?.turnOptions
+					? (await this.#resolveHostTurnOptions(preparedHostTurn.turnOptions)).model
+					: this.model;
+			const streamingNormalizedImages = await this.#normalizeImagesForModel(
+				options?.images,
+				streamingImagePrepModel,
+			);
+			const hostTurnPreparation = preparedHostTurn
+				? { operation: preparedHostTurn, created: true }
+				: options?.clientTurnId
+					? await this.#prepareHostTurn(
+							options.clientTurnId,
+							options.hostTurnKind ?? "follow_up",
+							expandedText,
+							{
+								...options,
+								images: streamingNormalizedImages,
+							},
+							true,
+						)
+					: undefined;
+			if (hostTurnPreparation) options?.onHostTurnPrepared?.();
+			if (
+				hostTurnPreparation &&
+				!hostTurnPreparation.created &&
+				this.#shouldShortCircuitHostTurnRetry(hostTurnPreparation.operation)
+			) {
+				return true;
+			}
+			const hostTurn = hostTurnPreparation?.operation;
 
 			// Steer/follow-up the keyword notices BEFORE the queued user message so the
 			// model reads the steering notice ahead of the prompt it modifies.
 			for (const notice of keywordNotices) {
-				await this.#queueCustomMessage(notice, streamingBehavior);
+				await this.#queueCustomMessage(
+					notice,
+					streamingBehavior,
+					undefined,
+					streamingBehavior === "followUp" ? hostTurn : undefined,
+				);
 			}
 			if (streamingBehavior === "followUp") {
-				await this.#queueUserMessage(expandedText, options?.images, "followUp");
+				await this.#queueUserMessage(expandedText, streamingNormalizedImages, "followUp", hostTurn);
 			} else {
-				await this.#queueUserMessage(expandedText, options?.images, "steer");
+				await this.#queueUserMessage(expandedText, streamingNormalizedImages, "steer");
 			}
 			return true;
 		}
@@ -5517,7 +6347,12 @@ export class AgentSession {
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTodoPrelude(expandedText) : undefined;
 		const eagerTaskPrelude =
 			!options?.synthetic && !hasPendingUserDirective ? this.#todo.createEagerTaskPrelude(expandedText) : undefined;
-		const normalizedImages = await this.#normalizeImagesForModel(options?.images);
+		const imagePrepModel = options?.turnOptions
+			? (await this.#resolveHostTurnOptions(options.turnOptions)).model
+			: preparedHostTurn?.turnOptions
+				? (await this.#resolveHostTurnOptions(preparedHostTurn.turnOptions)).model
+				: this.model;
+		const normalizedImages = await this.#normalizeImagesForModel(options?.images, imagePrepModel);
 
 		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 		if (normalizedImages?.length) {
@@ -5526,7 +6361,7 @@ export class AgentSession {
 		// Text-only model + image attachment: describe via a vision model and inject the
 		// description as a hidden companion (the image stays in the visible user message).
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, undefined, imagePrepModel)
 			: undefined;
 
 		const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
@@ -5554,16 +6389,68 @@ export class AgentSession {
 		}
 
 		let dispatched = false;
+		const hostTurnPreparation = preparedHostTurn
+			? { operation: preparedHostTurn, created: true }
+			: options?.clientTurnId
+				? await this.#prepareHostTurn(
+						options.clientTurnId,
+						options.hostTurnKind ?? "prompt",
+						expandedText,
+						{
+							...options,
+							images: normalizedImages,
+						},
+						true,
+					)
+				: undefined;
+		const hostTurn = hostTurnPreparation?.operation;
+		// Short-circuit before claiming the prepared window when another pipeline owns it.
+		if (
+			hostTurnPreparation &&
+			!hostTurnPreparation.created &&
+			this.#shouldShortCircuitHostTurnRetry(hostTurnPreparation.operation)
+		) {
+			options?.onHostTurnPrepared?.();
+			return true;
+		}
+		// Claim the prepared→dispatch window before ack so concurrent identical retries
+		// observe the in-flight op and do not start a second pipeline.
+		let claimedInflight = false;
+		if (hostTurn) {
+			if (this.#inflightPreparedHostTurns.has(hostTurn.clientTurnId)) {
+				options?.onHostTurnPrepared?.();
+				return true;
+			}
+			this.#inflightPreparedHostTurns.add(hostTurn.clientTurnId);
+			claimedInflight = true;
+		}
+
 		try {
+			if (hostTurnPreparation) options?.onHostTurnPrepared?.();
 			dispatched = await this.#promptWithMessage(message, expandedText, {
 				...options,
 				images: normalizedImages,
+				hostTurnOperation: hostTurn,
 				prependMessages:
 					preludeMessages.length > 0 || keywordNotices.length > 0 || imageDescriptionNotice
 						? [...preludeMessages, ...keywordNotices, ...(imageDescriptionNotice ? [imageDescriptionNotice] : [])]
 						: undefined,
 			});
+			if (hostTurn) {
+				const assistant = this.getLastAssistantMessage();
+				const outcome: HostTurnOutcome =
+					assistant?.stopReason === "aborted"
+						? "aborted"
+						: assistant?.stopReason === "error" || assistant === undefined
+							? "failed"
+							: "completed";
+				await this.#settleHostTurn(hostTurn, outcome);
+			}
+		} catch (error) {
+			if (hostTurn) await this.#settleHostTurn(hostTurn, "failed");
+			throw error;
 		} finally {
+			if (hostTurn && claimedInflight) this.#inflightPreparedHostTurns.delete(hostTurn.clientTurnId);
 			// Clean up residual eager-todo directive if the prompt never consumed it
 			// (e.g., compaction aborted, validation failed).
 			this.#toolChoiceQueue.removeByLabel("eager-todo");
@@ -5654,6 +6541,7 @@ export class AgentSession {
 		message: AgentMessage,
 		expandedText: string,
 		options?: Pick<PromptOptions, "toolChoice" | "images" | "skipCompactionCheck"> & {
+			hostTurnOperation?: HostTurnOperation;
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
@@ -5667,6 +6555,9 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		try {
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
+			if (options?.hostTurnOperation?.turnOptions) {
+				await this.#applyHostTurnOptions(options.hostTurnOperation.turnOptions);
+			}
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();
@@ -5875,6 +6766,12 @@ export class AgentSession {
 			if (planReferenceMessage) {
 				this.#planReferenceSent = true;
 			}
+			if (options?.hostTurnOperation) {
+				if (message.role !== "user" && message.role !== "developer") {
+					throw new Error("Host-turn dispatch requires a user or developer message");
+				}
+				await this.#commitHostTurnDispatch(message, options.hostTurnOperation);
+			}
 			try {
 				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
 			} finally {
@@ -6070,34 +6967,128 @@ export class AgentSession {
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
+		if (options?.turnOptions && !options.clientTurnId) {
+			throw new Error("turnOptions require a durable clientTurnId");
+		}
 
 		const expandedText =
 			options?.expandPromptTemplates === false ? text : expandPromptTemplate(text, [...this.#promptTemplates]);
+		// Normalize before preparation so the durable fingerprint matches the queue.
+		const followUpImagePrepModel = options?.turnOptions
+			? (await this.#resolveHostTurnOptions(options.turnOptions)).model
+			: this.model;
+		const followUpNormalizedImages = await this.#normalizeImagesForModel(images, followUpImagePrepModel);
+		const preparation = options?.clientTurnId
+			? await this.#prepareHostTurn(options.clientTurnId, options.hostTurnKind ?? "follow_up", expandedText, {
+					synthetic: options.synthetic,
+					attribution: options.attribution,
+					images: followUpNormalizedImages,
+					optionFingerprint: options.optionFingerprint,
+					turnOptions: options.turnOptions,
+				})
+			: undefined;
+		if (preparation && !preparation.created && this.#shouldShortCircuitHostTurnRetry(preparation.operation)) return;
+		await this.#enqueueFollowUp(expandedText, followUpNormalizedImages, options, preparation?.operation);
+	}
+
+	/** Queue an operation that a caller already prepared in the durable host-turn journal. */
+	async followUpPreparedHostTurn(clientTurnId: string): Promise<void> {
+		const operation = this.sessionManager
+			.getHostTurnOperations()
+			.find(candidate => candidate.clientTurnId === clientTurnId);
+		if (!operation) throw new Error(`Host turn ${clientTurnId}: prepared operation not found`);
+		if (operation.status !== "prepared") return;
+		if (operation.turnOptions) await this.#resolveHostTurnOptions(operation.turnOptions);
+		for (const candidate of this.#queuedHostTurns.values()) {
+			if (candidate.clientTurnId === clientTurnId) return;
+		}
+		if (this.#enqueuingPreparedHostTurns.has(clientTurnId)) return;
+		this.#enqueuingPreparedHostTurns.add(clientTurnId);
+		try {
+			// Re-read after the enqueue claim so a concurrent cancel_follow_up wins cleanly.
+			const current = this.sessionManager
+				.getHostTurnOperations()
+				.find(candidate => candidate.clientTurnId === clientTurnId);
+			if (current?.status !== "prepared") return;
+			const payload = this.#parsePreparedHostTurnPayload(current);
+			await this.#enqueueFollowUp(
+				payload.text,
+				payload.images,
+				{
+					synthetic: payload.synthetic,
+					expandPromptTemplates: false,
+					attribution: payload.attribution,
+					clientTurnId: current.clientTurnId,
+					hostTurnKind: current.kind,
+					optionFingerprint: current.optionFingerprint,
+					turnOptions: current.turnOptions,
+				},
+				current,
+			);
+			// Image prep / model resolution can await; recheck so a concurrent
+			// cancel_follow_up that settled the op is not followed by a queue insert.
+			const afterEnqueue = this.sessionManager
+				.getHostTurnOperations()
+				.find(candidate => candidate.clientTurnId === clientTurnId);
+			if (afterEnqueue?.status !== "prepared" && afterEnqueue?.status !== "dispatched") {
+				// Cancelled or failed during await — drop any queue units we just added.
+				await this.#cancelQueuedHostTurns("cancelled", new Set([clientTurnId]));
+			}
+		} finally {
+			this.#enqueuingPreparedHostTurns.delete(clientTurnId);
+		}
+	}
+
+	async #enqueueFollowUp(
+		expandedText: string,
+		images: ImageContent[] | undefined,
+		options: FollowUpOptions | undefined,
+		hostTurn: HostTurnOperation | undefined,
+	): Promise<void> {
 		if (!options?.synthetic) {
-			await this.#queueUserMessage(expandedText, images, "followUp");
+			await this.#queueUserMessage(expandedText, images, "followUp", hostTurn);
 			return;
 		}
 		// Synthetic branch: agent-initiated hidden developer message. Bypass
 		// #queueUserMessage (which clears advisor auto-resume suppression and
 		// enqueues as a user-attributed message) and place the developer message
 		// directly on the follow-up queue.
-		const normalizedImages = await this.#normalizeImagesForModel(images);
+		const imagePrepModel = hostTurn?.turnOptions
+			? (await this.#resolveHostTurnOptions(hostTurn.turnOptions)).model
+			: this.model;
+		const normalizedImages = await this.#normalizeImagesForModel(images, imagePrepModel);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
 		if (normalizedImages?.length) {
 			content.push(...normalizedImages);
 		}
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, undefined, imagePrepModel)
 			: undefined;
-		this.#allowQueuedMessageDrainRetry();
-		if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
-		this.agent.followUp({
-			role: "developer",
+		const message = {
+			role: "developer" as const,
 			content,
 			attribution: options.attribution ?? "agent",
 			timestamp: Date.now(),
-		});
+		};
+		if (hostTurn) this.#trackQueuedHostTurn(message, hostTurn);
+		this.#allowQueuedMessageDrainRetry();
+		if (imageDescriptionNotice) {
+			if (hostTurn) this.#trackQueuedHostTurnCompanion(imageDescriptionNotice, hostTurn);
+			this.agent.followUp(imageDescriptionNotice);
+		}
+		this.agent.followUp(message);
 		this.#scheduleIdleQueueDrain();
+		if (hostTurn?.optionFingerprint) {
+			const followUpQueue = this.agent.peekFollowUpQueue();
+			const userFollowUps = followUpQueue.filter(isUserQueuedMessage);
+			const queuePosition = userFollowUps.length > 0 ? userFollowUps.length : 1;
+			void this.#emitSessionEvent({
+				type: "follow_up_queued",
+				clientTurnId: hostTurn.clientTurnId,
+				optionFingerprint: hostTurn.optionFingerprint,
+				queuePosition,
+			});
+		}
 	}
 
 	/**
@@ -6131,12 +7122,16 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		mode: "steer" | "followUp",
+		hostTurn?: HostTurnOperation,
 	): Promise<void> {
 		// A queued user message (RPC/SDK/collab steer or follow-up, or a typed message
 		// while streaming) is a deliberate resume; re-enable advisor auto-resume that
 		// a user interrupt suppressed.
 		this.#advisors.autoResumeSuppressed = false;
-		const normalizedImages = await this.#normalizeImagesForModel(images);
+		const imagePrepModel = hostTurn?.turnOptions
+			? (await this.#resolveHostTurnOptions(hostTurn.turnOptions)).model
+			: this.model;
+		const normalizedImages = await this.#normalizeImagesForModel(images, imagePrepModel);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (normalizedImages?.length) {
 			content.push(...normalizedImages);
@@ -6144,17 +7139,22 @@ export class AgentSession {
 		// Text-only model + image attachment: describe via a vision model and enqueue the
 		// description as a hidden companion immediately before the user message.
 		const imageDescriptionNotice = normalizedImages?.length
-			? await this.#buildImageDescriptionNotice(normalizedImages)
+			? await this.#buildImageDescriptionNotice(normalizedImages, undefined, imagePrepModel)
 			: undefined;
 		this.#allowQueuedMessageDrainRetry();
 		if (mode === "followUp") {
-			if (imageDescriptionNotice) this.agent.followUp(imageDescriptionNotice);
-			this.agent.followUp({
-				role: "user",
+			const message = {
+				role: "user" as const,
 				content,
-				attribution: "user",
+				attribution: "user" as const,
 				timestamp: Date.now(),
-			});
+			};
+			if (hostTurn) this.#trackQueuedHostTurn(message, hostTurn);
+			if (imageDescriptionNotice) {
+				if (hostTurn) this.#trackQueuedHostTurnCompanion(imageDescriptionNotice, hostTurn);
+				this.agent.followUp(imageDescriptionNotice);
+			}
+			this.agent.followUp(message);
 		} else {
 			if (imageDescriptionNotice) this.agent.steer(imageDescriptionNotice);
 			this.agent.steer({
@@ -6166,6 +7166,17 @@ export class AgentSession {
 			});
 		}
 		this.#scheduleIdleQueueDrain();
+		if (hostTurn?.optionFingerprint && mode === "followUp") {
+			const followUpQueue = this.agent.peekFollowUpQueue();
+			const userFollowUps = followUpQueue.filter(isUserQueuedMessage);
+			const queuePosition = userFollowUps.length > 0 ? userFollowUps.length : 1;
+			void this.#emitSessionEvent({
+				type: "follow_up_queued",
+				clientTurnId: hostTurn.clientTurnId,
+				optionFingerprint: hostTurn.optionFingerprint,
+				queuePosition,
+			});
+		}
 	}
 
 	#scheduleIdleQueueDrain(): void {
@@ -6354,6 +7365,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		deliverAs: "steer" | "followUp",
 		queueChipText?: string,
+		hostTurn?: HostTurnOperation,
 	): Promise<void> {
 		const details =
 			queueChipText !== undefined
@@ -6377,6 +7389,7 @@ export class AgentSession {
 		const normalizedAppMessage = await this.#normalizeAgentMessageImages(appMessage);
 		this.#allowQueuedMessageDrainRetry();
 		if (deliverAs === "followUp") {
+			if (hostTurn) this.#trackQueuedHostTurnCompanion(normalizedAppMessage, hostTurn);
 			this.agent.followUp(normalizedAppMessage);
 		} else {
 			this.agent.steer(normalizedAppMessage);
@@ -6553,8 +7566,17 @@ export class AgentSession {
 		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
 			? isAdvisorCard
 			: m => !isUserQueuedMessage(m) && !isHiddenUserCompanion(m);
+		// Cancel host turns for every follow-up the keep filter drops — not only
+		// isUserQueuedMessage rows. #cancelQueuedHostTurnForMessage no-ops when a
+		// message has no tracked host turn (advisor/hidden companions).
+		const removedFollowUps = followUpAll.filter(message => !keep(message));
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
 		this.#reconcileQueuedMessageDrain();
+		for (const message of removedFollowUps) {
+			void this.#cancelQueuedHostTurnForMessage(message, options?.forInterrupt ? "interrupted" : "cleared").catch(
+				error => logger.warn("Failed to cancel queued host turn", { error: String(error) }),
+			);
+		}
 		return { steering, followUp };
 	}
 
@@ -6612,6 +7634,9 @@ export class AgentSession {
 			const removed = followUp[fromFollowUp];
 			this.agent.replaceQueues(steering.slice(), removeWithCompanions(followUp, fromFollowUp));
 			this.#reconcileQueuedMessageDrain();
+			void this.#cancelQueuedHostTurnForMessage(removed, "popped").catch(error =>
+				logger.warn("Failed to cancel queued host turn", { error: String(error) }),
+			);
 			return toRestoredQueuedMessage(removed);
 		}
 		return undefined;
@@ -6919,6 +7944,7 @@ export class AgentSession {
 					...options,
 					additionalDirectories: this.settings.get("workspace.additionalDirectories"),
 				});
+				this.#clearHostTurnRuntimeTracking();
 				this.#bash.markSessionTransition(bashTransition);
 				// The new session owns the transcript from here, so the previous
 				// conversation's advisor spend is retired with it. Clearing at the commit
@@ -8170,6 +9196,7 @@ export class AgentSession {
 				this.#advisors.restoreCost(await loadAdvisorTranscriptCosts(this.sessionFile));
 			}
 			this.#bash.finishSessionTransition(bashTransition, true);
+			this.#clearHostTurnRuntimeTracking();
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
 				this.#notifySessionChangeCallbacks();
 			}

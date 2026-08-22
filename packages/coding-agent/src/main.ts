@@ -101,7 +101,7 @@ type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
 type RunRpcMode = (
 	session: AgentSession,
-	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
+	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
@@ -1776,7 +1776,7 @@ export async function runRootCommand(
 			// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
 			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
 			stopStartupWatchdog();
-			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
+			await runRpcMode(session, setToolUIContext, eventBus, rpcInput);
 		} else if (isInteractive) {
 			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 			const startupChangelog = await startupChangelogPromise;

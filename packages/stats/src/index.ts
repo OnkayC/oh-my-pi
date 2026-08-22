@@ -105,6 +105,17 @@ export interface StandaloneStatsArgs {
 	help: boolean;
 }
 
+function parseStandalonePort(value: string): number {
+	if (!/^\d+$/.test(value)) {
+		throw new Error(`Invalid port: ${value}`);
+	}
+	const port = Number(value);
+	if (port > 65_535) {
+		throw new Error(`Invalid port: ${value}`);
+	}
+	return port;
+}
+
 /** Parse the standalone `omp-stats` arguments used by the production entry point. */
 export function parseStandaloneStatsArgs(args: string[]): StandaloneStatsArgs {
 	const { values } = parseArgs({
@@ -119,7 +130,7 @@ export function parseStandaloneStatsArgs(args: string[]): StandaloneStatsArgs {
 		allowPositionals: true,
 	});
 	return {
-		port: parseInt(values.port || "3847", 10),
+		port: parseStandalonePort(values.port || "3847"),
 		host: values.host || "127.0.0.1",
 		json: values.json ?? false,
 		sync: values.sync ?? false,

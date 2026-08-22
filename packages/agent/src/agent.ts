@@ -428,6 +428,7 @@ export class Agent {
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
 	#beforeQueuedMessageDequeueHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
+	#followUpDequeueBarriers = new Set<(message: AgentMessage) => unknown | undefined>();
 	#beforeModelCallHooks = new Set<(signal?: AbortSignal) => Promise<void> | void>();
 
 	/** Buffered Cursor tool results with text length at time of call (for correct ordering) */
@@ -813,6 +814,16 @@ export class Agent {
 		return () => this.#beforeQueuedMessageDequeueHooks.delete(registration);
 	}
 
+	/**
+	 * Keep matching follow-up units isolated when `followUpMode` would otherwise drain the full queue.
+	 * Messages that resolve to the same non-undefined key and are contiguous at the queue head are
+	 * dequeued together; a later key remains a barrier for the next provider turn.
+	 */
+	addFollowUpDequeueBarrier(resolveKey: (message: AgentMessage) => unknown | undefined): () => void {
+		this.#followUpDequeueBarriers.add(resolveKey);
+		return () => this.#followUpDequeueBarriers.delete(resolveKey);
+	}
+
 	/** Register an independently removable hook that runs immediately before each model call. */
 	addBeforeModelCallHook(hook: (signal?: AbortSignal) => Promise<void> | void): () => void {
 		const registration = (signal?: AbortSignal) => hook(signal);
@@ -1066,16 +1077,47 @@ export class Agent {
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
-		if (this.#followUpMode === "one-at-a-time") {
-			if (this.#followUpQueue.length > 0) {
-				const first = this.#followUpQueue[0];
-				this.#followUpQueue = this.#followUpQueue.slice(1);
-				return [first];
+		if (this.#followUpQueue.length === 0) return [];
+
+		const barrierKeyAt = (index: number): unknown | undefined => {
+			const message = this.#followUpQueue[index]!;
+			for (const resolveKey of this.#followUpDequeueBarriers) {
+				const key = resolveKey(message);
+				if (key !== undefined && key !== false) return key;
 			}
-			return [];
+			return undefined;
+		};
+
+		let dequeueCount: number;
+		if (this.#followUpMode === "one-at-a-time") {
+			// Default to a single message, but keep a matching-key host unit atomic
+			// (companion + host message share one barrier and must leave together).
+			dequeueCount = 1;
+			const headKey = barrierKeyAt(0);
+			if (headKey !== undefined) {
+				while (dequeueCount < this.#followUpQueue.length && Object.is(barrierKeyAt(dequeueCount), headKey)) {
+					dequeueCount++;
+				}
+			}
+		} else {
+			dequeueCount = this.#followUpQueue.length;
+			for (let index = 0; index < this.#followUpQueue.length; index++) {
+				const barrierKey = barrierKeyAt(index);
+				if (barrierKey === undefined) continue;
+				if (index > 0) {
+					dequeueCount = index;
+				} else {
+					dequeueCount = 1;
+					while (dequeueCount < this.#followUpQueue.length && Object.is(barrierKeyAt(dequeueCount), barrierKey)) {
+						dequeueCount++;
+					}
+				}
+				break;
+			}
 		}
-		const followUp = this.#followUpQueue.slice();
-		this.#followUpQueue = [];
+
+		const followUp = this.#followUpQueue.slice(0, dequeueCount);
+		this.#followUpQueue = this.#followUpQueue.slice(dequeueCount);
 		return followUp;
 	}
 
