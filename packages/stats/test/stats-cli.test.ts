@@ -21,4 +21,12 @@ describe("standalone stats CLI", () => {
 		expect(formatStatsDashboardUrl("::", 3850)).toBe("http://[::]:3850");
 		expect(formatStatsDashboardUrl("2001:db8::1", 3850)).toBe("http://[2001:db8::1]:3850");
 	});
+
+	it("rejects malformed and out-of-range ports", () => {
+		expect(() => parseStandaloneStatsArgs(["--port", "3847x"])).toThrow("Invalid port: 3847x");
+		expect(() => parseStandaloneStatsArgs(["--port", "0x5000"])).toThrow("Invalid port: 0x5000");
+		expect(() => parseStandaloneStatsArgs(["--port", "65536"])).toThrow("Invalid port: 65536");
+		expect(parseStandaloneStatsArgs(["--port", "0"]).port).toBe(0);
+		expect(parseStandaloneStatsArgs(["--port", "65535"]).port).toBe(65535);
+	});
 });

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, AgentBusyError, type AgentEvent, type AgentTool, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { SimpleStreamOptions, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { Message, SimpleStreamOptions, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { kCursorExecResolved } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
@@ -265,6 +265,130 @@ describe("Agent", () => {
 		agent.followUp({ role: "user", content: "second turn", timestamp: Date.now() });
 		await agent.continue();
 		expect(calls).toBe(1);
+	});
+
+	it("dequeues contiguous companion messages with their barrier host as one unit", async () => {
+		const mock = createMockModel({
+			responses: [{ content: ["first host done"] }, { content: ["second host done"] }],
+		});
+		const agent = new Agent({
+			streamFn: mock.stream,
+			followUpMode: "all",
+			convertToLlm: messages =>
+				messages.flatMap((message): Message[] => {
+					if (message.role === "custom") {
+						return [{ role: "user", content: message.content, timestamp: message.timestamp }];
+					}
+					return message.role === "assistant" || message.role === "user" || message.role === "toolResult"
+						? [message]
+						: [];
+				}),
+		});
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+
+		const firstBarrier = {};
+		const secondBarrier = {};
+		const firstCompanion = {
+			role: "custom" as const,
+			customType: "image-attachment-description",
+			content: "first companion",
+			display: false,
+			timestamp: Date.now(),
+		};
+		const firstHost = { role: "user" as const, content: "first host", timestamp: Date.now() };
+		const secondCompanion = {
+			role: "custom" as const,
+			customType: "ultrathink-notice",
+			content: "second companion",
+			display: false,
+			timestamp: Date.now(),
+		};
+		const secondHost = { role: "user" as const, content: "second host", timestamp: Date.now() };
+		const barrierByMessage = new Map<object, object>();
+		barrierByMessage.set(firstCompanion, firstBarrier);
+		barrierByMessage.set(firstHost, firstBarrier);
+		barrierByMessage.set(secondCompanion, secondBarrier);
+		barrierByMessage.set(secondHost, secondBarrier);
+		agent.addFollowUpDequeueBarrier(message => barrierByMessage.get(message));
+		agent.followUp(firstCompanion);
+		agent.followUp(firstHost);
+		agent.followUp(secondCompanion);
+		agent.followUp(secondHost);
+
+		await agent.continue();
+
+		expect(mock.calls).toHaveLength(2);
+		const firstRequest = JSON.stringify(mock.calls[0]?.context.messages);
+		expect(firstRequest).toContain("first companion");
+		expect(firstRequest).toContain("first host");
+		expect(firstRequest).not.toContain("second companion");
+		expect(firstRequest).not.toContain("second host");
+		const secondRequest = JSON.stringify(mock.calls[1]?.context.messages);
+		expect(secondRequest).toContain("second companion");
+		expect(secondRequest).toContain("second host");
+		expect(agent.peekFollowUpQueue()).toHaveLength(0);
+	});
+
+	it("honors matching-key barriers in one-at-a-time followUpMode", async () => {
+		const mock = createMockModel({
+			responses: [{ content: ["first host done"] }, { content: ["second host done"] }],
+		});
+		const agent = new Agent({
+			streamFn: mock.stream,
+			followUpMode: "one-at-a-time",
+			convertToLlm: messages =>
+				messages.flatMap((message): Message[] => {
+					if (message.role === "custom") {
+						return [{ role: "user", content: message.content, timestamp: message.timestamp }];
+					}
+					return message.role === "assistant" || message.role === "user" || message.role === "toolResult"
+						? [message]
+						: [];
+				}),
+		});
+		agent.replaceMessages([createAssistantMessage([{ type: "text", text: "ready" }])]);
+
+		const firstBarrier = {};
+		const secondBarrier = {};
+		const firstCompanion = {
+			role: "custom" as const,
+			customType: "image-attachment-description",
+			content: "first companion",
+			display: false,
+			timestamp: Date.now(),
+		};
+		const firstHost = { role: "user" as const, content: "first host", timestamp: Date.now() };
+		const secondCompanion = {
+			role: "custom" as const,
+			customType: "ultrathink-notice",
+			content: "second companion",
+			display: false,
+			timestamp: Date.now(),
+		};
+		const secondHost = { role: "user" as const, content: "second host", timestamp: Date.now() };
+		const barrierByMessage = new Map<object, object>();
+		barrierByMessage.set(firstCompanion, firstBarrier);
+		barrierByMessage.set(firstHost, firstBarrier);
+		barrierByMessage.set(secondCompanion, secondBarrier);
+		barrierByMessage.set(secondHost, secondBarrier);
+		agent.addFollowUpDequeueBarrier(message => barrierByMessage.get(message));
+		agent.followUp(firstCompanion);
+		agent.followUp(firstHost);
+		agent.followUp(secondCompanion);
+		agent.followUp(secondHost);
+
+		await agent.continue();
+
+		expect(mock.calls).toHaveLength(2);
+		const firstRequest = JSON.stringify(mock.calls[0]?.context.messages);
+		expect(firstRequest).toContain("first companion");
+		expect(firstRequest).toContain("first host");
+		expect(firstRequest).not.toContain("second companion");
+		expect(firstRequest).not.toContain("second host");
+		const secondRequest = JSON.stringify(mock.calls[1]?.context.messages);
+		expect(secondRequest).toContain("second companion");
+		expect(secondRequest).toContain("second host");
+		expect(agent.peekFollowUpQueue()).toHaveLength(0);
 	});
 
 	it("continue() leaves queued messages owned when its signal is already aborted", async () => {

@@ -99,6 +99,14 @@ impl ChildProcess {
 		#[allow(unused_mut, reason = "only mutated on some platforms")]
 		let mut sigchld = sys::signal::chld_signal_listener()?;
 
+		// The child can stop between spawning and installing the SIGCHLD listener.
+		// Its wait status remains observable even though Tokio never saw the signal.
+		if let Some(pid) = self.pid
+			&& sys::signal::poll_for_stopped_child(pid)?
+		{
+			return Ok(ProcessWaitResult::Stopped);
+		}
+
 		let cancelled = async {
 			match &cancel_token {
 				Some(token) => token.cancelled().await,
@@ -126,7 +134,9 @@ impl ChildProcess {
 					break Ok(ProcessWaitResult::Stopped)
 				},
 				_ = sigchld.recv() => {
-					if sys::signal::poll_for_stopped_children()? {
+					if let Some(pid) = self.pid
+						&& sys::signal::poll_for_stopped_child(pid)?
+					{
 						break Ok(ProcessWaitResult::Stopped);
 					}
 				},

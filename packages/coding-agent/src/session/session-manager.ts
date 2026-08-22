@@ -23,6 +23,23 @@ import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
 import {
+	type CancelPreparedHostTurnOperationInput,
+	fingerprintHostTurnPayload,
+	foldHostTurnOperations,
+	HOST_TURN_CUSTOM_TYPE,
+	HOST_TURN_OPERATION_CUSTOM_TYPE,
+	type HostTurnBoundary,
+	type HostTurnLineage,
+	type HostTurnOperation,
+	type HostTurnRollbackInput,
+	type HostTurnRollbackResult,
+	hostTurnOperationData,
+	hostTurnOptionsEqual,
+	type MarkHostTurnDispatchedInput,
+	type PrepareHostTurnOperationInput,
+	type SettleHostTurnOperationInput,
+} from "./host-turns";
+import {
 	type BashExecutionMessage,
 	type CustomMessage,
 	type FileMentionMessage,
@@ -410,6 +427,18 @@ interface AtomicEntryBatch {
 	preBatchLeafId: string | null;
 	externalLeafChanged: boolean;
 	externalLeafId: string | null;
+}
+
+interface HostTurnLineageSession {
+	header: SessionHeader;
+	entries: SessionEntry[];
+	sessionFile?: string;
+}
+
+interface HostTurnRollbackPlan {
+	lineage: HostTurnLineageSession[];
+	removed: Array<{ turn: HostTurnBoundary; sessionIndex: number }>;
+	actualSuffix: string[];
 }
 
 /**
@@ -1095,6 +1124,16 @@ export class SessionManager {
 		this.#hasTitleSlot = true;
 
 		const timestamp = nowIso();
+		const parentLeafId =
+			options?.parentLeafId ??
+			(options?.parentSession
+				? (() => {
+						const parentPath = path.resolve(options.parentSession);
+						const currentPath = this.#sessionFile ? path.resolve(this.#sessionFile) : undefined;
+						if (currentPath && parentPath === currentPath) return this.#index.leafId() ?? undefined;
+						return undefined;
+					})()
+				: undefined);
 		this.#header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -1102,6 +1141,7 @@ export class SessionManager {
 			timestamp,
 			cwd: this.#cwd,
 			parentSession: options?.parentSession,
+			parentLeafId,
 			providerPromptCacheKey: options?.providerPromptCacheKey,
 		};
 		const workspace = normalizeSessionWorkspace({
@@ -1317,6 +1357,14 @@ export class SessionManager {
 			clone.#forceFileCreation = false;
 		}
 		return clone;
+	}
+
+	/** Open another journal through the same storage backend and session root. */
+	async openSiblingSession(filePath: string): Promise<SessionManager> {
+		return await SessionManager.open(filePath, this.#sessionDir, this.#storage, {
+			initialCwd: this.#cwd,
+			suppressBreadcrumb: true,
+		});
 	}
 
 	restoreState(snapshot: SessionManagerStateSnapshot): void {
@@ -1966,6 +2014,11 @@ export class SessionManager {
 		return !!this.#sessionFile && this.#storage.existsSync(this.#sessionFile);
 	}
 
+	/** Whether a session journal exists in this manager's storage backend. */
+	sessionFileExists(sessionFile: string): boolean {
+		return this.#storage.existsSync(sessionFile);
+	}
+
 	getArtifactsDir(): string | null {
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager.dir;
 		return artifactsDirectoryFor(this.#sessionFile);
@@ -2285,6 +2338,338 @@ export class SessionManager {
 	}
 
 	/**
+	 * Record the prepared half of a host-owned turn. This synchronous form exists
+	 * so a caller can include the marker in a larger appendEntriesAtomically batch.
+	 */
+	recordPreparedHostTurnOperation(input: PrepareHostTurnOperationInput): HostTurnOperation {
+		const clientTurnId = input.clientTurnId.trim();
+		if (!clientTurnId) throw new Error("clientTurnId must be a non-empty string");
+		const payloadFingerprint = input.payloadFingerprint ?? fingerprintHostTurnPayload(input.kind, input.payload);
+		const existing = this.getHostTurnOperations().find(operation => operation.clientTurnId === clientTurnId);
+		if (existing) {
+			if (
+				existing.kind !== input.kind ||
+				existing.payloadFingerprint !== payloadFingerprint ||
+				existing.optionFingerprint !== input.optionFingerprint ||
+				!hostTurnOptionsEqual(existing.turnOptions, input.turnOptions)
+			) {
+				throw new Error(`Host turn ${clientTurnId}: clientTurnId already exists with different content`);
+			}
+			return existing;
+		}
+
+		const preparedAt = nowIso();
+		const lineage: HostTurnLineage = {
+			sessionId: input.lineage?.sessionId ?? this.#sessionId,
+			sessionFile: input.lineage?.sessionFile ?? this.#sessionFile,
+			parentSessionId: input.lineage?.parentSessionId,
+			parentSessionFile: input.lineage?.parentSessionFile ?? this.#header.parentSession,
+		};
+		const operation: HostTurnOperation = {
+			schemaVersion: 1,
+			operationId: Bun.randomUUIDv7(),
+			clientTurnId,
+			kind: input.kind,
+			payload: input.payload,
+			payloadFingerprint,
+			optionFingerprint: input.optionFingerprint,
+			turnOptions: input.turnOptions,
+			status: "prepared",
+			preparedAt,
+			lineage,
+			journalEntryId: "",
+			preparedEntryId: "",
+		};
+		const journalEntryId = this.appendCustomEntry(HOST_TURN_OPERATION_CUSTOM_TYPE, hostTurnOperationData(operation));
+		return { ...operation, journalEntryId, preparedEntryId: journalEntryId };
+	}
+
+	async prepareHostTurnOperationWithStatus(
+		input: PrepareHostTurnOperationInput,
+	): Promise<{ operation: HostTurnOperation; created: boolean }> {
+		let created = false;
+		const operation = await this.appendEntriesAtomically(() => {
+			const clientTurnId = input.clientTurnId.trim();
+			created = !this.getHostTurnOperations().some(candidate => candidate.clientTurnId === clientTurnId);
+			return this.recordPreparedHostTurnOperation(input);
+		});
+		return { operation, created };
+	}
+
+	async prepareHostTurnOperation(input: PrepareHostTurnOperationInput): Promise<HostTurnOperation> {
+		return (await this.prepareHostTurnOperationWithStatus(input)).operation;
+	}
+
+	/** Record a native dispatch inside an existing atomic entry batch. */
+	recordHostTurnDispatched(input: MarkHostTurnDispatchedInput): HostTurnOperation {
+		const current = this.#requireHostTurnOperation(input.clientTurnId, input.payloadFingerprint);
+		if (current.status === "settled") return current;
+		if (current.status === "dispatched") {
+			const existing = current.nativeIdentity;
+			if (
+				!existing ||
+				existing.sessionId !== input.nativeIdentity.sessionId ||
+				existing.entryId !== input.nativeIdentity.entryId ||
+				existing.sessionFile !== input.nativeIdentity.sessionFile
+			) {
+				throw new Error(`Host turn ${input.clientTurnId}: native dispatch identity conflicts with durable state`);
+			}
+			return current;
+		}
+		const next: HostTurnOperation = {
+			...current,
+			status: "dispatched",
+			dispatchedAt: nowIso(),
+			nativeIdentity: input.nativeIdentity,
+		};
+		const journalEntryId = this.appendCustomEntry(HOST_TURN_OPERATION_CUSTOM_TYPE, hostTurnOperationData(next));
+		this.appendCustomEntry(HOST_TURN_CUSTOM_TYPE, {
+			schemaVersion: 1,
+			clientTurnId: next.clientTurnId,
+			kind: next.kind,
+			payloadFingerprint: next.payloadFingerprint,
+			operationId: next.operationId,
+			preparedEntryId: next.preparedEntryId,
+			dispatchedAt: next.dispatchedAt,
+			nativeIdentity: next.nativeIdentity,
+			lineage: next.lineage,
+		});
+		return { ...next, journalEntryId };
+	}
+
+	markHostTurnDispatched(input: MarkHostTurnDispatchedInput): Promise<HostTurnOperation> {
+		return this.appendEntriesAtomically(() => this.recordHostTurnDispatched(input));
+	}
+
+	settleHostTurnOperation(input: SettleHostTurnOperationInput): Promise<HostTurnOperation> {
+		return this.appendEntriesAtomically(() => {
+			const current = this.#requireHostTurnOperation(input.clientTurnId, input.payloadFingerprint);
+			if (current.status === "prepared") {
+				throw new Error(`Host turn ${input.clientTurnId}: cannot settle before dispatch`);
+			}
+			if (current.status === "settled") {
+				if (current.outcome !== input.outcome) {
+					throw new Error(`Host turn ${input.clientTurnId}: terminal outcome conflicts with durable state`);
+				}
+				return current;
+			}
+			const next: HostTurnOperation = {
+				...current,
+				status: "settled",
+				settledAt: nowIso(),
+				outcome: input.outcome,
+			};
+			const journalEntryId = this.appendCustomEntry(HOST_TURN_OPERATION_CUSTOM_TYPE, hostTurnOperationData(next));
+			return { ...next, journalEntryId };
+		});
+	}
+
+	cancelPreparedHostTurnOperation(input: CancelPreparedHostTurnOperationInput): Promise<HostTurnOperation> {
+		return this.appendEntriesAtomically(() => {
+			const current = this.#requireHostTurnOperation(input.clientTurnId, input.payloadFingerprint);
+			if (current.status === "dispatched") {
+				throw new Error(`Host turn ${input.clientTurnId}: cannot cancel after dispatch`);
+			}
+			if (current.status === "settled") {
+				if (current.outcome !== input.outcome) {
+					throw new Error(`Host turn ${input.clientTurnId}: terminal outcome conflicts with durable state`);
+				}
+				return current;
+			}
+			const next: HostTurnOperation = {
+				...current,
+				status: "settled",
+				settledAt: nowIso(),
+				outcome: input.outcome,
+			};
+			const journalEntryId = this.appendCustomEntry(HOST_TURN_OPERATION_CUSTOM_TYPE, hostTurnOperationData(next));
+			return { ...next, journalEntryId };
+		});
+	}
+
+	getHostTurnOperations(): HostTurnOperation[] {
+		return foldHostTurnOperations(this.getBranch());
+	}
+
+	async getHostTurns(): Promise<HostTurnBoundary[]> {
+		const lineage = await this.#loadHostTurnLineage();
+		const turns: HostTurnBoundary[] = [];
+		for (const session of lineage) {
+			for (const operation of foldHostTurnOperations(session.entries)) {
+				// Prepared turns are durable acknowledgements that must participate
+				// in suffix validation so rollback cannot silently drop them.
+				if (operation.status !== "prepared" && !operation.dispatchedAt) continue;
+				turns.push({
+					clientTurnId: operation.clientTurnId,
+					kind: operation.kind,
+					payloadFingerprint: operation.payloadFingerprint,
+					status: operation.status,
+					outcome: operation.outcome,
+					preparedAt: operation.preparedAt,
+					dispatchedAt: operation.dispatchedAt,
+					settledAt: operation.settledAt,
+					nativeIdentity: operation.nativeIdentity,
+					lineage: operation.lineage,
+					operationId: operation.operationId,
+					preparedEntryId: operation.preparedEntryId,
+				});
+			}
+		}
+		return turns;
+	}
+
+	async validateHostTurnRollback(input: HostTurnRollbackInput): Promise<void> {
+		await this.#planHostTurnRollback(input);
+	}
+
+	async rollbackHostTurns(input: HostTurnRollbackInput): Promise<HostTurnRollbackResult> {
+		const { lineage, removed, actualSuffix } = await this.#planHostTurnRollback(input);
+		const firstRemoved = removed[0]!;
+		const target = lineage[firstRemoved.sessionIndex]!;
+		const preparedIndex = target.entries.findIndex(entry => entry.id === firstRemoved.turn.preparedEntryId);
+		if (preparedIndex < 0) throw new Error("Host-turn rollback boundary is missing from the durable journal");
+		await this.#replaceHostTurnRollbackState(target, target.entries.slice(0, preparedIndex));
+		return {
+			removedClientTurnIds: actualSuffix,
+			remainingTurns: await this.getHostTurns(),
+			sessionId: this.#sessionId,
+			sessionFile: this.#sessionFile,
+		};
+	}
+
+	async #planHostTurnRollback(input: HostTurnRollbackInput): Promise<HostTurnRollbackPlan> {
+		if (!Number.isInteger(input.count) || input.count <= 0) throw new Error("count must be a positive integer");
+		if (input.expectedClientTurnIds.length !== input.count) {
+			throw new Error("expectedClientTurnIds length must equal count");
+		}
+
+		const lineage = await this.#loadHostTurnLineage();
+		const located: Array<{ turn: HostTurnBoundary; sessionIndex: number }> = [];
+		for (let sessionIndex = 0; sessionIndex < lineage.length; sessionIndex++) {
+			const session = lineage[sessionIndex]!;
+			for (const operation of foldHostTurnOperations(session.entries)) {
+				if (operation.status !== "prepared" && !operation.dispatchedAt) continue;
+				located.push({
+					sessionIndex,
+					turn: {
+						clientTurnId: operation.clientTurnId,
+						kind: operation.kind,
+						payloadFingerprint: operation.payloadFingerprint,
+						status: operation.status,
+						outcome: operation.outcome,
+						preparedAt: operation.preparedAt,
+						dispatchedAt: operation.dispatchedAt,
+						settledAt: operation.settledAt,
+						nativeIdentity: operation.nativeIdentity,
+						lineage: operation.lineage,
+						operationId: operation.operationId,
+						preparedEntryId: operation.preparedEntryId,
+					},
+				});
+			}
+		}
+		if (input.count > located.length) throw new Error("rollback count exceeds available host turns");
+		const removed = located.slice(-input.count);
+		const actualSuffix = removed.map(item => item.turn.clientTurnId);
+		if (actualSuffix.some((clientTurnId, index) => clientTurnId !== input.expectedClientTurnIds[index])) {
+			throw new Error("expectedClientTurnIds does not match the current host-turn suffix");
+		}
+		const firstRemoved = removed[0]!;
+		// Host-turn lineage is oldest→newest after reverse(); the active session is last.
+		// Rollback may only rewrite that session's journal — never a parent session file.
+		const activeSessionIndex = lineage.length - 1;
+		if (
+			firstRemoved.sessionIndex !== activeSessionIndex ||
+			removed.some(item => item.sessionIndex !== activeSessionIndex)
+		) {
+			throw new Error("Host-turn rollback cannot cross session boundaries");
+		}
+		const target = lineage[firstRemoved.sessionIndex]!;
+		if (!target.entries.some(entry => entry.id === firstRemoved.turn.preparedEntryId)) {
+			throw new Error("Host-turn rollback boundary is missing from the durable journal");
+		}
+		return { lineage, removed, actualSuffix };
+	}
+
+	#requireHostTurnOperation(clientTurnId: string, payloadFingerprint: string): HostTurnOperation {
+		const current = this.getHostTurnOperations().find(operation => operation.clientTurnId === clientTurnId);
+		if (!current) throw new Error(`Host turn ${clientTurnId}: prepared operation not found`);
+		if (current.payloadFingerprint !== payloadFingerprint) {
+			throw new Error(`Host turn ${clientTurnId}: payload fingerprint conflicts with durable state`);
+		}
+		return current;
+	}
+
+	async #loadHostTurnLineage(): Promise<HostTurnLineageSession[]> {
+		const current: HostTurnLineageSession = {
+			header: structuredClone(this.#header),
+			entries: this.getBranch(),
+			sessionFile: this.#sessionFile,
+		};
+		const sessions: HostTurnLineageSession[] = [current];
+		let childEntries = current.entries;
+		let childHeader: SessionHeader = this.#header;
+		let parentSession = this.#header.parentSession;
+		const seen = new Set<string>();
+		while (parentSession && this.#storage.existsSync(parentSession)) {
+			const resolvedParentSession = path.resolve(parentSession);
+			if (seen.has(resolvedParentSession)) break;
+			seen.add(resolvedParentSession);
+			const loaded = await loadEntriesFromFile(parentSession, this.#storage);
+			const header = loaded.find(entry => entry.type === "session") as SessionHeader | undefined;
+			if (!header) break;
+			// Prefer the leaf frozen at child creation; fall back to the active leaf for legacy sessions.
+			const persistedEntries = loaded.filter((entry): entry is SessionEntry => entry.type !== "session");
+			const parentIndex = new SessionEntryIndex();
+			parentIndex.rebuild(persistedEntries);
+			const parentLeafId = childHeader.parentLeafId;
+			if (parentLeafId && !parentIndex.has(parentLeafId)) {
+				// Fork boundary is gone from the parent journal; stop rather than invent lineage.
+				break;
+			}
+			const entries = parentIndex.pathTo(parentLeafId ?? undefined);
+			// Copied branches preserve entry IDs, so overlap means the child already owns its inherited history.
+			const childEntryIds = new Set(childEntries.map(entry => entry.id));
+			if (entries.some(entry => childEntryIds.has(entry.id))) break;
+			sessions.push({ header, entries, sessionFile: parentSession });
+			childEntries = entries;
+			childHeader = header;
+			parentSession = header.parentSession;
+		}
+		return sessions.reverse();
+	}
+
+	async #replaceHostTurnRollbackState(
+		target: { header: SessionHeader; entries: SessionEntry[]; sessionFile?: string },
+		entries: SessionEntry[],
+	): Promise<void> {
+		await this.#withAtomicPersistenceLock(async () => {
+			const snapshot = this.captureState();
+			try {
+				await this.#drainAndCloseWriter();
+				this.#sessionFile = target.sessionFile;
+				this.#applyEntries(structuredClone(target.header), structuredClone(entries));
+				this.#additionalDirectories = this.#header.additionalDirectories ?? [];
+				this.#sessionName = this.#header.title;
+				this.#titleSource = this.#header.titleSource;
+				this.#titleUpdatedAt = this.#header.timestamp;
+				this.#hasTitleSlot = true;
+				this.#fileIsCurrent = false;
+				this.#rewriteRequired = this.#persist;
+				this.#forceFileCreation = this.#persist;
+				this.#artifactManager = null;
+				this.#artifactManagerSessionFile = null;
+				this.#adoptedArtifactManager = null;
+				if (this.#persist && this.#sessionFile) await this.#rewriteAtomically();
+				if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
+			} catch (error) {
+				this.restoreState(snapshot);
+				throw error;
+			}
+		});
+	}
+
+	/**
 	 * Rewrite the session file after in-place entry updates (e.g. pruning old tool
 	 * outputs). Use sparingly.
 	 */
@@ -2566,6 +2951,7 @@ export class SessionManager {
 			title: this.#sessionName,
 			titleSource: this.#titleSource,
 			parentSession: this.#persist ? sourceSessionFile : undefined,
+			parentLeafId: this.#persist ? leafId : undefined,
 			additionalDirectories: this.#additionalDirectories.length > 0 ? [...this.#additionalDirectories] : undefined,
 		};
 
