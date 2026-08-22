@@ -1180,6 +1180,7 @@ export class ExtensionRunner {
 			cwd: this.cwd,
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
+			isProjectTrusted: () => true,
 			get model() {
 				return getModel();
 			},

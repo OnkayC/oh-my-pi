@@ -537,6 +537,10 @@ export class PlanModeController {
 		let previousTools: string[] | undefined;
 		let previousMountedTools: string[] | undefined;
 		let previousModel: { model: Model; thinkingLevel: ConfiguredThinkingLevel | undefined } | undefined;
+		const previousPlanModeState = this.#session.getPlanModeState();
+		// Plan mode state must be visible before Code Mode repartitions tools so
+		// the top-level write transport remains available for plan approval.
+		this.#session.setPlanModeState({ enabled: true, planFilePath, workflow, reentry });
 		if (installRuntime) {
 			previousTools = this.#session.getEnabledToolNames();
 			previousMountedTools = this.#session.getMountedXdevToolNames();
@@ -552,6 +556,7 @@ export class PlanModeController {
 				await this.#session.setActiveToolsByName(planTools);
 				if (!input.preserveRestoredModel) await this.#applyPlanModel();
 			} catch (error) {
+				this.#session.setPlanModeState(previousPlanModeState);
 				try {
 					await this.#session
 						.setActiveToolPresentation(previousTools, previousMountedTools)
@@ -574,7 +579,6 @@ export class PlanModeController {
 			}
 		}
 		try {
-			this.#session.setPlanModeState({ enabled: true, planFilePath, workflow, reentry });
 			this.#session.setPlanProposalHandler(async title => {
 				const request = await this.createReview({ title });
 				return {

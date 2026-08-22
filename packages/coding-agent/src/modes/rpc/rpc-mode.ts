@@ -54,6 +54,7 @@ import { type AcpBuiltinSlashCommandResult, executeAcpBuiltinSlashCommand } from
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { lookupBuiltinSlashCommand } from "../../slash-commands/builtin-registry";
 import { parseSlashCommand } from "../../slash-commands/helpers/parse";
+import type { SlashCommandRuntime } from "../../slash-commands/types";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import type { EventBus } from "../../utils/event-bus";
 import { calculateTokensPerSecond } from "../../utils/token-rate";
@@ -83,6 +84,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResolvedFrame,
 	RpcExtensionUIResponse,
+	RpcExtensionUISelectOptionDetail,
 	RpcHostToolCallRequest,
 	RpcHostToolCancelRequest,
 	RpcHostToolDefinition,
@@ -1409,6 +1411,42 @@ function isSubagentSubscriptionLevel(value: unknown): value is RpcSubagentSubscr
 	return value === "off" || value === "progress" || value === "events";
 }
 
+/** Sends an RPC select request while retaining aligned option descriptions. */
+export function requestRpcSelect(
+	pendingRequests: Map<string, PendingExtensionRequest>,
+	output: RpcOutput,
+	title: string,
+	options: ExtensionUISelectItem[],
+	dialogOptions?: ExtensionUIDialogOptions,
+): Promise<string | undefined> {
+	const labels = new Array<string>(options.length);
+	let optionDetails: RpcExtensionUISelectOptionDetail[] | undefined;
+	for (let index = 0; index < options.length; index++) {
+		const option = options[index]!;
+		labels[index] = getExtensionUISelectOptionLabel(option);
+		if (typeof option === "string") continue;
+		const description = option.description?.trim();
+		if (!description) continue;
+		optionDetails ??= Array.from({ length: options.length }, () => ({}));
+		optionDetails[index] = { description };
+	}
+
+	return requestRpcDialog(
+		pendingRequests,
+		output,
+		dialogOptions,
+		undefined,
+		{
+			method: "select",
+			title,
+			options: labels,
+			...(optionDetails ? { optionDetails } : {}),
+			timeout: dialogOptions?.timeout,
+		},
+		response => parseValueDialogResponse(response, dialogOptions),
+	);
+}
+
 export function requestRpcEditor(
 	pendingRequests: Map<string, PendingExtensionRequest>,
 	output: RpcOutput,
@@ -1706,7 +1744,7 @@ async function recoverOnePreparedSpecialHostTurn(
  */
 export async function runRpcMode(
 	session: AgentSession,
-	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
+	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
 ): Promise<never> {
@@ -1846,19 +1884,7 @@ export async function runRpcMode(
 			options: ExtensionUISelectItem[],
 			dialogOptions?: ExtensionUIDialogOptions,
 		): Promise<string | undefined> {
-			return requestRpcDialog(
-				this.pendingRequests,
-				this.output,
-				dialogOptions,
-				undefined,
-				{
-					method: "select",
-					title,
-					options: options.map(getExtensionUISelectOptionLabel),
-					timeout: dialogOptions?.timeout,
-				},
-				response => parseValueDialogResponse(response, dialogOptions),
-			);
+			return requestRpcSelect(this.pendingRequests, this.output, title, options, dialogOptions);
 		}
 
 		confirm(title: string, message: string, dialogOptions?: ExtensionUIDialogOptions): Promise<boolean> {
@@ -2058,7 +2084,7 @@ export async function runRpcMode(
 	// A single shared instance routes all responses received on stdin to the
 	// correct waiting promise regardless of which code path created the request.
 	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
-	setToolUIContext(rpcUiContext, true);
+	setToolUIContext?.(rpcUiContext, true);
 	let hostTurnRecovery: Promise<void> | undefined;
 	let planReviewRecovery: Promise<void> | undefined;
 
@@ -2338,7 +2364,7 @@ export async function runRpcMode(
 						"durable_builtin_not_supported",
 					);
 				}
-				const builtinRuntime = {
+				const builtinRuntime: SlashCommandRuntime = {
 					session,
 					sessionManager: session.sessionManager,
 					settings: session.settings,
@@ -2346,6 +2372,7 @@ export async function runRpcMode(
 					output: (text: string) => output({ type: "command_output", text }),
 					refreshCommands: emitAvailableCommandsUpdate,
 					reloadPlugins: reloadPluginState,
+					runCommandInBackground: task => shutdownCoordinator.track(task()),
 					notifyTitleChanged: async () => {
 						output({ type: "session_info_update", title: session.sessionName, sessionId: session.sessionId });
 					},
@@ -2442,7 +2469,11 @@ export async function runRpcMode(
 						);
 						return success(id, "prompt");
 					}
-					return success(id, "prompt", { agentInvoked: false });
+					// A consumed builtin is normally local-only, but some (e.g.
+					// `/retry`) schedule an agent turn whose events stream after
+					// this response. Report that so the host does not finalize the
+					// request as non-agent work while the agent is running.
+					return success(id, "prompt", { agentInvoked: builtinResult.agentInvoked === true });
 				}
 
 				// Don't await the full turn: events stream after durable preparation is authoritative.

@@ -615,6 +615,10 @@ export interface RpcApprovalResolvedFrame {
 // ============================================================================
 // Extension UI Events (stdout)
 // ============================================================================
+/** Positional presentation metadata for an RPC select option. */
+export interface RpcExtensionUISelectOptionDetail {
+	description?: string;
+}
 
 export interface RpcAskRequestFrame {
 	type: "extension_ui_request";
@@ -634,7 +638,15 @@ export interface RpcExtensionUIResolvedFrame {
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest =
 	| RpcAskRequestFrame
-	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "select";
+			title: string;
+			options: string[];
+			optionDetails?: RpcExtensionUISelectOptionDetail[];
+			timeout?: number;
+	  }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
 	| {
 			type: "extension_ui_request";
