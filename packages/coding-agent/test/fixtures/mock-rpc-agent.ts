@@ -7,6 +7,14 @@
  * Used by rpc-client lifecycle tests that need to exercise start/stop/start
  * without booting the full agent runtime (which requires provider credentials).
  */
+import * as fs from "node:fs";
+import {
+	MAX_RPC_FRAME_BYTES,
+	MAX_RPC_REASSEMBLED_BYTES,
+	RpcFrameDecoder,
+	RpcFrameEncoder,
+} from "../../src/modes/rpc/rpc-frame";
+
 if (Bun.env.MOCK_RPC_PID_FILE) {
 	await Bun.write(Bun.env.MOCK_RPC_PID_FILE, String(process.pid));
 }
@@ -15,6 +23,9 @@ if (Bun.env.MOCK_RPC_IGNORE_SIGTERM === "1") {
 }
 
 const supportsProtocolV2 = Bun.env.MOCK_RPC_V2 === "1";
+const semanticCapabilities = Bun.env.MOCK_RPC_CAPABILITIES
+	? (JSON.parse(Bun.env.MOCK_RPC_CAPABILITIES) as Record<string, number>)
+	: undefined;
 const legacyState = {
 	thinkingLevel: "off",
 	isStreaming: false,
@@ -42,6 +53,8 @@ if (Bun.env.MOCK_RPC_EXIT_BEFORE_READY) {
 }
 
 let protocolV2Enabled = false;
+let frameDecoder = new RpcFrameDecoder();
+const frameEncoder = new RpcFrameEncoder();
 process.stdout.write(
 	`${JSON.stringify(
 		supportsProtocolV2
@@ -49,41 +62,34 @@ process.stdout.write(
 					type: "ready",
 					protocolVersion: 1,
 					supportedProtocolVersions: [1, 2],
-					maxFrameBytes: 1024 * 1024,
-					maxReassembledFrameBytes: 64 * 1024 * 1024,
+					maxFrameBytes: MAX_RPC_FRAME_BYTES,
+					maxReassembledFrameBytes: MAX_RPC_REASSEMBLED_BYTES,
+					...(semanticCapabilities ? { capabilities: semanticCapabilities } : {}),
 				}
-			: { type: "ready" },
+			: { type: "ready", ...(semanticCapabilities ? { capabilities: semanticCapabilities } : {}) },
 	)}\n`,
 );
 
 function writeFrame(frame: Record<string, unknown>): void {
-	const logical = Buffer.from(JSON.stringify(frame), "utf8");
-	if (!protocolV2Enabled || logical.byteLength <= 1024 * 1024) {
-		process.stdout.write(`${logical.toString("utf8")}\n`);
-		return;
-	}
-	const chunkBytes = 256 * 1024;
-	const count = Math.ceil(logical.byteLength / chunkBytes);
-	for (let index = 0; index < count; index++) {
-		process.stdout.write(
-			`${JSON.stringify({
-				type: "rpc_chunk",
-				chunkId: "mock-rpc-v2",
-				index,
-				count,
-				byteLength: logical.byteLength,
-				data: logical.subarray(index * chunkBytes, (index + 1) * chunkBytes).toString("base64"),
-			})}\n`,
-		);
-	}
+	for (const encoded of frameEncoder.encodeFrames(frame)) process.stdout.write(encoded);
 }
 
 // Bun's `console` is an AsyncIterable over stdin lines.
 for await (const raw of console) {
 	if (!raw) continue;
+	if (Bun.env.MOCK_RPC_PHYSICAL_CAPTURE_FILE) {
+		fs.appendFileSync(Bun.env.MOCK_RPC_PHYSICAL_CAPTURE_FILE, `${raw}\n`);
+	}
 	try {
-		const frame = JSON.parse(raw) as Record<string, unknown>;
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		if (parsed.type === "rpc_chunk" && !protocolV2Enabled) throw new Error("chunk before protocol negotiation");
+		const decoded = protocolV2Enabled ? frameDecoder.push(parsed) : parsed;
+		if (!decoded) continue;
+		const frame = decoded as Record<string, unknown>;
 		if (frame && typeof frame === "object" && typeof frame.type === "string") {
+			if (Bun.env.MOCK_RPC_CAPTURE_FILE) {
+				fs.appendFileSync(Bun.env.MOCK_RPC_CAPTURE_FILE, `${JSON.stringify(frame)}\n`);
+			}
 			if (Bun.env.MOCK_RPC_EXIT_ON_COMMAND) {
 				process.stderr.write(Bun.env.MOCK_RPC_EXIT_STDERR ?? "");
 				process.exit(Number(Bun.env.MOCK_RPC_EXIT_ON_COMMAND));
@@ -103,6 +109,17 @@ for await (const raw of console) {
 					data: { protocolVersion: 2 },
 				});
 				protocolV2Enabled = true;
+				frameEncoder.setProtocolVersion(2);
+				continue;
+			}
+			if (frame.type === "negotiate_capabilities") {
+				writeFrame({
+					id,
+					type: "response",
+					command: frame.type,
+					success: true,
+					data: { capabilities: frame.capabilities },
+				});
 				continue;
 			}
 			if (frame.type === "get_messages_page") {
@@ -191,6 +208,7 @@ for await (const raw of console) {
 			});
 		}
 	} catch {
+		frameDecoder = new RpcFrameDecoder();
 		// ignore parse errors — the test harness sends well-formed frames.
 	}
 }

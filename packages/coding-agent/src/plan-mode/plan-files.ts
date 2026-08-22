@@ -4,14 +4,22 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { normalizeLocalScheme, resolveToCwd } from "../tools/path-utils";
 
+/** Resolve a plan from a local URL or cwd-relative filesystem path. */
+export function resolvePlanFilePath(
+	planFilePath: string,
+	options: { localProtocolOptions: LocalProtocolOptions; cwd: string },
+): string {
+	return planFilePath.startsWith("local:")
+		? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), options.localProtocolOptions)
+		: resolveToCwd(planFilePath, options.cwd);
+}
+
 /** Reads a plan from a local URL or cwd-relative filesystem path. */
 export async function readPlanFile(
 	planFilePath: string,
 	options: { localProtocolOptions: LocalProtocolOptions; cwd: string },
 ): Promise<string | null> {
-	const resolvedPath = planFilePath.startsWith("local:")
-		? resolveLocalUrlToPath(normalizeLocalScheme(planFilePath), options.localProtocolOptions)
-		: resolveToCwd(planFilePath, options.cwd);
+	const resolvedPath = resolvePlanFilePath(planFilePath, options);
 	try {
 		return await Bun.file(resolvedPath).text();
 	} catch (error) {

@@ -5,6 +5,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
+import type { Effort } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -33,6 +34,8 @@ export interface TestSessionOptions {
 	extensionRunner?: ExtensionRunner;
 	/** Secret obfuscator to wire into the session (e.g. to test deobfuscation of persisted tool arguments) */
 	obfuscator?: SecretObfuscator;
+	/** Hard ceiling on the session's thinking effort for ceiling-clamp regressions. */
+	thinkingLevelCeiling?: Effort;
 }
 
 /**
@@ -116,6 +119,7 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		modelRegistry,
 		extensionRunner: options.extensionRunner,
 		obfuscator: options.obfuscator,
+		thinkingLevelCeiling: options.thinkingLevelCeiling,
 	});
 
 	// Must subscribe to enable session persistence

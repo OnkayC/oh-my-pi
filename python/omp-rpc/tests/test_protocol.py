@@ -4,9 +4,13 @@ import unittest
 
 from omp_rpc import (
     AgentEndEvent,
+    ApprovalRequest,
+    ApprovalResolved,
+    AskResolved,
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     ExtensionUiRequest,
+    ReadyEvent,
     SessionState,
     TodoReminderEvent,
     assistant_text,
@@ -255,6 +259,116 @@ class ProtocolParsingTests(unittest.TestCase):
 
         self.assertEqual(request.message, "Continue?")
         self.assertIsNone(request.option_details)
+
+    def test_parse_semantic_capabilities_and_interaction_frames(self) -> None:
+        ready = parse_notification(
+            {
+                "type": "ready",
+                "capabilities": {
+                    "structuredApprovals": 1,
+                    "richUserInput": 1,
+                    "runtimePolicy": 2,
+                    "futureFeature": 9,
+                },
+            }
+        )
+        self.assertIsInstance(ready, ReadyEvent)
+        assert isinstance(ready, ReadyEvent) and ready.capabilities is not None
+        self.assertEqual(ready.capabilities.runtime_policy, 2)
+        self.assertEqual(
+            ready.capabilities.to_wire(),
+            {
+                "structuredApprovals": 1,
+                "runtimePolicy": 2,
+                "richUserInput": 1,
+            },
+        )
+
+        approval = parse_notification(
+            {
+                "type": "approval_request",
+                "id": "approval-1",
+                "sessionId": "session-1",
+                "toolCallId": "tool-1",
+                "toolName": "bash",
+                "approvalMode": "always-ask",
+                "tier": "exec",
+                "arguments": {"command": "pwd"},
+                "reason": "Runs a command",
+                "details": ["pwd"],
+                "providerSafetyChecks": [],
+                "allowedDecisions": ["approve_once", "deny", "cancel"],
+            }
+        )
+        self.assertIsInstance(approval, ApprovalRequest)
+        assert isinstance(approval, ApprovalRequest)
+        self.assertEqual(approval.tool_name, "bash")
+        self.assertEqual(approval.allowed_decisions, ("approve_once", "deny", "cancel"))
+
+        resolved = parse_notification(
+            {
+                "type": "approval_resolved",
+                "id": "approval-1",
+                "outcome": "accepted",
+                "decision": "approve_once",
+            }
+        )
+        self.assertIsInstance(resolved, ApprovalResolved)
+
+        ask = parse_notification(
+            {
+                "type": "extension_ui_request",
+                "id": "ask-1",
+                "method": "ask",
+                "timeout": 1000,
+                "questions": [
+                    {
+                        "id": "q1",
+                        "question": "Choose",
+                        "header": "Choice",
+                        "options": [
+                            {
+                                "label": "A",
+                                "description": "First",
+                                "preview": "Preview A",
+                            }
+                        ],
+                        "multi": True,
+                        "recommended": 0,
+                        "allowCustom": True,
+                    }
+                ],
+            }
+        )
+        self.assertIsInstance(ask, ExtensionUiRequest)
+        assert isinstance(ask, ExtensionUiRequest) and ask.questions is not None
+        self.assertEqual(ask.questions[0].options[0].preview, "Preview A")
+        self.assertTrue(ask.requires_response())
+
+        ask_resolved = parse_notification(
+            {
+                "type": "extension_ui_resolved",
+                "id": "ask-1",
+                "method": "ask",
+                "outcome": "submitted",
+                "result": {
+                    "kind": "submit",
+                    "results": [
+                        {
+                            "id": "q1",
+                            "question": "Choose",
+                            "options": ["A"],
+                            "multi": True,
+                            "selectedOptions": ["A"],
+                            "note": "Looks good",
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertIsInstance(ask_resolved, AskResolved)
+        assert isinstance(ask_resolved, AskResolved) and ask_resolved.result is not None
+        self.assertEqual(ask_resolved.result.kind, "submit")
 
     def test_parse_open_url_request(self) -> None:
         notification = parse_notification(

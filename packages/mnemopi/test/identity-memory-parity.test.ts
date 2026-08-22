@@ -32,6 +32,8 @@ afterEach(() => {
 });
 
 describe("identity memory parity", () => {
+	// Schema bootstrap can still starve past 5s under bun --parallel=8 even with
+	// embeddings disabled; allow the same headroom as other mnemopi CI-hardened tests.
 	it("creates identity columns and indexes on working and episodic memory", () => {
 		const beam = new BeamMemory({ sessionId: "schema", dbPath: tempDb() });
 		try {
@@ -62,7 +64,7 @@ describe("identity memory parity", () => {
 		} finally {
 			beam.close();
 		}
-	});
+	}, 30_000);
 
 	it("stores author and channel identity on remember and defaults channel to session", () => {
 		const dbPath = tempDb();

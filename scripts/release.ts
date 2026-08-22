@@ -379,7 +379,7 @@ async function cmdRelease(versionOrBump: string): Promise<void> {
 	await git(["commit", "-m", `chore: bump version to ${version}`]);
 	console.log();
 
-	// 8. Tag, then push branch + tag atomically — pushing the tag by object id.
+	// 8. Tag, then push branch + tag atomically. The pushed tag is the release trigger.
 	//
 	// This repo is in the global `[maintenance] repo = …` list, so a scheduled
 	// `git maintenance run` fetches origin with `fetch.pruneTags=true` (set
@@ -413,10 +413,8 @@ async function cmdRelease(versionOrBump: string): Promise<void> {
 	if (success) {
 		console.log(`=== Released v${version} ===`);
 	} else {
-		// CI's `concurrency` block (.github/workflows/ci.yml) recognizes a
-		// release run by its `chore: bump version to vX.Y.Z` subject (#2564),
-		// so retries that keep that subject also get the per-sha, never-cancel
-		// group. Reword the body, not the subject.
+		// CI treats the pushed `v*` ref as the authoritative release run. Retrying
+		// moves that remote tag to the fixed commit and triggers a new release run.
 		console.log("\nTo retry after fixing (repeat until CI passes):");
 		console.log(`  git commit -m "chore: bump version to ${version}" -m "<what was fixed>"`);
 		console.log(`  git tag -f v${version}`);

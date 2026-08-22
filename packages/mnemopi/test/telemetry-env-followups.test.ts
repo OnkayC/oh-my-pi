@@ -1,8 +1,18 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BeamMemory } from "@oh-my-pi/pi-mnemopi/core/beam";
+
+// Disable on-demand embeddings; otherwise first BeamMemory open can hang past
+// the 5s default timeout under bun --parallel=8 on loaded CI runners.
+// Capture/restore so concurrent suites cannot inherit a sticky env mutation.
+let priorNoEmbeddings: string | undefined;
+
+beforeEach(() => {
+	priorNoEmbeddings = process.env.MNEMOPI_NO_EMBEDDINGS;
+	process.env.MNEMOPI_NO_EMBEDDINGS = "1";
+});
 
 const roots: string[] = [];
 
@@ -18,9 +28,15 @@ afterEach(() => {
 		if (root === undefined) break;
 		rmSync(root, { recursive: true, force: true });
 	}
+	if (priorNoEmbeddings === undefined) {
+		delete process.env.MNEMOPI_NO_EMBEDDINGS;
+	} else {
+		process.env.MNEMOPI_NO_EMBEDDINGS = priorNoEmbeddings;
+	}
 });
 
 describe("telemetry and env follow-up parity", () => {
+	// Recall can exceed the 5s default under bun --parallel=8 on loaded runners.
 	it("fallback episodic rows expose explicit zero dense_score and linear voice_scores", async () => {
 		const beam = new BeamMemory({ sessionId: "s1", dbPath: tempDb() });
 		try {
@@ -50,7 +66,7 @@ describe("telemetry and env follow-up parity", () => {
 		} finally {
 			beam.close();
 		}
-	});
+	}, 30_000);
 
 	it("main recall path preserves numeric dense_score and voice_scores on working memory", async () => {
 		const beam = new BeamMemory({ sessionId: "s1", dbPath: tempDb() });
