@@ -115,6 +115,87 @@ describe("RpcHostToolBridge", () => {
 });
 
 describe("RpcClient custom tools", () => {
+	it("installs configured host tools before negotiating durable host-turn replay", async () => {
+		const scriptPath = path.join(os.tmpdir(), `omp-rpc-host-tools-startup-${Date.now()}.js`);
+		tempPaths.push(scriptPath);
+		await Bun.write(
+			scriptPath,
+			`
+let buffer = "";
+let hostToolsInstalled = false;
+
+function write(frame) {
+	process.stdout.write(JSON.stringify(frame) + "\\n");
+}
+
+write({ type: "ready", capabilities: { hostTurns: 1 } });
+
+process.stdin.on("data", chunk => {
+	buffer += chunk.toString("utf8");
+	let index = buffer.indexOf("\\n");
+	while (index !== -1) {
+		const line = buffer.slice(0, index).trim();
+		buffer = buffer.slice(index + 1);
+		if (line) handle(JSON.parse(line));
+		index = buffer.indexOf("\\n");
+	}
+});
+
+function handle(frame) {
+	if (frame.type === "set_host_tools") {
+		hostToolsInstalled = true;
+		write({
+			id: frame.id,
+			type: "response",
+			command: "set_host_tools",
+			success: true,
+			data: { toolNames: frame.tools.map(tool => tool.name) },
+		});
+		return;
+	}
+	if (frame.type === "negotiate_capabilities") {
+		write(
+			hostToolsInstalled
+				? {
+						id: frame.id,
+						type: "response",
+						command: "negotiate_capabilities",
+						success: true,
+						data: { capabilities: { hostTurns: 1 } },
+					}
+				: {
+						id: frame.id,
+						type: "response",
+						command: "negotiate_capabilities",
+						success: false,
+						error: "host tools were not installed before hostTurns negotiation",
+					},
+		);
+	}
+}
+`,
+		);
+
+		const client = new RpcClient({
+			cliPath: scriptPath,
+			customTools: [
+				defineRpcClientTool({
+					name: "host_ready",
+					description: "Marks the host tool surface ready",
+					parameters: { type: "object", properties: {}, additionalProperties: false },
+					execute: async () => "ready",
+				}),
+			],
+		});
+
+		try {
+			await client.start();
+			expect(client.selectedCapabilities).toEqual({ hostTurns: 1 });
+		} finally {
+			await client.stop();
+		}
+	});
+
 	it("registers host custom tools and serves tool calls over the RPC transport", async () => {
 		const scriptPath = path.join(os.tmpdir(), `omp-rpc-host-tools-${Date.now()}.js`);
 		tempPaths.push(scriptPath);

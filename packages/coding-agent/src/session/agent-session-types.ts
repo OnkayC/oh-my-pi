@@ -36,6 +36,7 @@ import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
+import type { HostTurnKind, HostTurnOptions } from "./host-turns";
 import type { SessionManager } from "./session-manager";
 
 /** Maximum time the interactive shutdown path waits for Mnemopi consolidation. */
@@ -308,6 +309,16 @@ export interface PromptOptions {
 	attribution?: MessageAttribution;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
+	/** Durable host-owned turn identity used by native RPC. */
+	clientTurnId?: string;
+	/** Journal classification for ordinary, follow-up, and plan turns. */
+	hostTurnKind?: HostTurnKind;
+	/** Called after a host-owned turn has been authoritatively prepared or matched idempotently. */
+	onHostTurnPrepared?: () => void;
+	/** Host option fingerprint associated with a durable queued prompt. */
+	optionFingerprint?: string;
+	/** Target model/thinking/fastMode options to validate before durable acceptance. */
+	turnOptions?: HostTurnOptions;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled
@@ -328,6 +339,14 @@ export interface FollowUpOptions {
 	expandPromptTemplates?: boolean;
 	/** Explicit billing/initiator attribution. */
 	attribution?: MessageAttribution;
+	/** Durable host-owned turn identity committed when this follow-up is promoted. */
+	clientTurnId?: string;
+	/** Journal classification for plan refinement/execution follow-ups. */
+	hostTurnKind?: HostTurnKind;
+	/** Host option fingerprint associated with a queued follow-up turn. */
+	optionFingerprint?: string;
+	/** Target model/thinking/fastMode options to apply on promotion. */
+	turnOptions?: HostTurnOptions;
 }
 
 /** Result from a handoff operation. */

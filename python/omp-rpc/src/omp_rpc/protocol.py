@@ -18,7 +18,23 @@ ThinkingLevel: TypeAlias = Literal[
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
+ApprovalMode: TypeAlias = Literal["always-ask", "write", "yolo"]
+AuthStatusValue: TypeAlias = Literal[
+    "authenticated", "unauthenticated", "expired", "error"
+]
+ApprovalDecision: TypeAlias = Literal[
+    "approve_once", "approve_session", "deny", "cancel"
+]
+ApprovalOutcome: TypeAlias = Literal[
+    "accepted", "denied", "cancelled", "timed_out", "stale", "aborted"
+]
+AskOutcome: TypeAlias = Literal[
+    "submitted", "chat", "cancelled", "timed_out", "stale", "aborted"
+]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
+HostTurnKind: TypeAlias = Literal["prompt", "follow_up", "plan_execute", "plan_refine"]
+HostTurnOperationStatus: TypeAlias = Literal["prepared", "dispatched", "settled"]
+HostTurnOutcome: TypeAlias = Literal["completed", "cancelled", "aborted", "failed"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
 TodoStatus: TypeAlias = Literal[
@@ -26,6 +42,7 @@ TodoStatus: TypeAlias = Literal[
 ]
 ExtensionUiMethod: TypeAlias = Literal[
     "select",
+    "ask",
     "confirm",
     "input",
     "editor",
@@ -38,7 +55,7 @@ ExtensionUiMethod: TypeAlias = Literal[
     "open_url",
 ]
 InteractiveExtensionUiMethod: TypeAlias = Literal[
-    "select", "confirm", "input", "editor"
+    "select", "confirm", "input", "editor", "ask"
 ]
 PassiveExtensionUiMethod: TypeAlias = Literal[
     "notify",
@@ -61,7 +78,7 @@ PASSIVE_EXTENSION_UI_METHODS: Final[frozenset[PassiveExtensionUiMethod]] = froze
     }
 )
 INTERACTIVE_EXTENSION_UI_METHODS: Final[frozenset[InteractiveExtensionUiMethod]] = (
-    frozenset({"select", "confirm", "input", "editor"})
+    frozenset({"select", "confirm", "input", "editor", "ask"})
 )
 VALUE_EXTENSION_UI_METHODS: Final[frozenset[ValueExtensionUiMethod]] = frozenset(
     {"select", "input", "editor"}
@@ -75,6 +92,37 @@ _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
+_HOST_TURN_KIND_VALUES: Final[frozenset[str]] = frozenset(
+    {"prompt", "follow_up", "plan_execute", "plan_refine"}
+)
+_HOST_TURN_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"prepared", "dispatched", "settled"}
+)
+_HOST_TURN_OUTCOME_VALUES: Final[frozenset[str]] = frozenset(
+    {"completed", "cancelled", "aborted", "failed"}
+)
+_APPROVAL_MODE_VALUES: Final[frozenset[str]] = frozenset(
+    {"always-ask", "write", "yolo"}
+)
+_AUTH_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"authenticated", "unauthenticated", "expired", "error"}
+)
+_AUTH_ACCOUNT_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"authenticated", "expired", "error"}
+)
+_APPROVAL_DECISION_VALUES: Final[frozenset[str]] = frozenset(
+    {"approve_once", "approve_session", "deny", "cancel"}
+)
+_APPROVAL_OUTCOME_VALUES: Final[frozenset[str]] = frozenset(
+    {"accepted", "denied", "cancelled", "timed_out", "stale", "aborted"}
+)
+_ASK_OUTCOME_VALUES: Final[frozenset[str]] = frozenset(
+    {"submitted", "chat", "cancelled", "timed_out", "stale", "aborted"}
+)
+_APPROVAL_TIER_VALUES: Final[frozenset[str]] = frozenset({"read", "write", "exec"})
+_AUTH_ACCOUNT_TYPE_VALUES: Final[frozenset[str]] = frozenset(
+    {"api_key", "oauth"}
+)
 _NOTIFY_TYPE_VALUES: Final[frozenset[str]] = frozenset({"info", "warning", "error"})
 _WIDGET_PLACEMENT_VALUES: Final[frozenset[str]] = frozenset(
     {"aboveEditor", "belowEditor"}
@@ -85,6 +133,7 @@ _TODO_STATUS_VALUES: Final[frozenset[str]] = frozenset(
 _EXTENSION_UI_METHOD_VALUES: Final[frozenset[str]] = frozenset(
     {
         "select",
+        "ask",
         "confirm",
         "input",
         "editor",
@@ -213,6 +262,12 @@ def _require_bool(payload: JsonObject, field: str) -> bool:
         raise ValueError(f"{field} must be a boolean")
     return value
 
+def _require_int(payload: JsonObject, field: str) -> int:
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} must be an integer")
+    return value
+
 
 def _optional_str(payload: JsonObject, field: str) -> str | None:
     value = payload.get(field)
@@ -262,6 +317,16 @@ def _optional_int(payload: JsonObject, field: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be an integer")
     return value
+
+def _require_string_tuple(values: object, *, field: str) -> tuple[str, ...]:
+    if not isinstance(values, list):
+        raise ValueError(f"{field} must be a list")
+    result: list[str] = []
+    for index, item in enumerate(values):
+        if not isinstance(item, str):
+            raise ValueError(f"{field}[{index}] must be a string")
+        result.append(item)
+    return tuple(result)
 
 
 def _optional_float(payload: JsonObject, field: str) -> float | None:
@@ -756,6 +821,89 @@ AssistantMessageEvent: TypeAlias = (
 
 
 @dataclass(slots=True, frozen=True)
+class SemanticCapabilities:
+    structured_approvals: int | None = None
+    runtime_policy: int | None = None
+    auth_status: int | None = None
+    rich_user_input: int | None = None
+    plan_control: int | None = None
+    plan_review: int | None = None
+    host_turns: int | None = None
+    model_catalog: int | None = None
+    slash_commands: int | None = None
+    skills: int | None = None
+    tasks: int | None = None
+    subagents: int | None = None
+
+    def to_wire(self) -> JsonObject:
+        result: JsonObject = {}
+        for wire_name, attribute_name in _SEMANTIC_CAPABILITY_FIELDS:
+            revision = getattr(self, attribute_name)
+            if revision is not None:
+                result[wire_name] = revision
+        return result
+
+    def is_empty(self) -> bool:
+        return all(
+            getattr(self, attribute_name) is None
+            for _, attribute_name in _SEMANTIC_CAPABILITY_FIELDS
+        )
+
+
+_SEMANTIC_CAPABILITY_FIELDS: Final[tuple[tuple[str, str], ...]] = (
+    ("structuredApprovals", "structured_approvals"),
+    ("runtimePolicy", "runtime_policy"),
+    ("authStatus", "auth_status"),
+    ("richUserInput", "rich_user_input"),
+    ("planControl", "plan_control"),
+    ("planReview", "plan_review"),
+    ("hostTurns", "host_turns"),
+    ("modelCatalog", "model_catalog"),
+    ("slashCommands", "slash_commands"),
+    ("skills", "skills"),
+    ("tasks", "tasks"),
+    ("subagents", "subagents"),
+)
+
+
+@dataclass(slots=True, frozen=True)
+class RuntimePolicy:
+    approval_mode: ApprovalMode
+
+
+@dataclass(slots=True, frozen=True)
+class AuthAccountStatus:
+    type: Literal["api_key", "oauth"]
+    status: Literal["authenticated", "expired", "error"]
+    account_id: str | None = None
+    email: str | None = None
+    project_id: str | None = None
+    enterprise_url: str | None = None
+    org_id: str | None = None
+    org_name: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AuthProviderStatus:
+    provider: str
+    status: AuthStatusValue
+    accounts: tuple[AuthAccountStatus, ...]
+    error: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AuthStatus:
+    providers: tuple[AuthProviderStatus, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class AvailableSkill:
+    name: str
+    description: str
+    source: str
+
+
+@dataclass(slots=True, frozen=True)
 class ModelCost:
     input: float
     output: float
@@ -794,6 +942,8 @@ class ModelInfo:
     priority: int | None = None
     thinking: ThinkingConfig | None = None
     compat: JsonObject | None = None
+    thinking_efforts: tuple[Effort, ...] | None = None
+    fast_mode_supported: bool | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -843,6 +993,7 @@ class SessionState:
     auto_compaction_enabled: bool
     message_count: int
     queued_message_count: int
+    approval_mode: ApprovalMode | None = None
     todo_phases: tuple[TodoPhase, ...] = ()
     system_prompt: tuple[str, ...] = ()
     dump_tools: tuple[ToolDescriptor, ...] = ()
@@ -897,6 +1048,44 @@ class ThinkingLevelCycleResult:
 class CancellationResult:
     cancelled: bool
 
+@dataclass(slots=True, frozen=True)
+class HostTurnNativeIdentity:
+    session_id: str
+    entry_id: str | None = None
+    session_file: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HostTurnLineage:
+    session_id: str
+    session_file: str | None = None
+    parent_session_id: str | None = None
+    parent_session_file: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HostTurnBoundary:
+    client_turn_id: str
+    kind: HostTurnKind
+    payload_fingerprint: str
+    status: HostTurnOperationStatus
+    prepared_at: str
+    lineage: HostTurnLineage
+    operation_id: str
+    prepared_entry_id: str
+    outcome: HostTurnOutcome | None = None
+    dispatched_at: str | None = None
+    settled_at: str | None = None
+    native_identity: HostTurnNativeIdentity | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HostTurnRollbackResult:
+    removed_client_turn_ids: tuple[str, ...]
+    turns: tuple[HostTurnBoundary, ...]
+    session_id: str
+    session_file: str | None = None
+
 
 @dataclass(slots=True, frozen=True)
 class BranchMessage:
@@ -939,6 +1128,7 @@ class ReadyEvent:
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    capabilities: SemanticCapabilities | None = None
     type: Literal["ready"] = "ready"
 
 
@@ -947,6 +1137,101 @@ class MessagesPage:
     messages: tuple[AgentMessage, ...]
     total_messages: int
     next_cursor: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class AskDialogOption:
+    label: str
+    description: str | None = None
+    preview: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AskDialogQuestion:
+    id: str
+    question: str
+    options: tuple[AskDialogOption, ...]
+    header: str | None = None
+    multi: bool | None = None
+    recommended: int | None = None
+    allow_custom: bool | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class AskDialogResultItem:
+    id: str
+    question: str
+    options: tuple[str, ...]
+    multi: bool
+    selected_options: tuple[str, ...]
+    custom_input: str | None = None
+    note: str | None = None
+    timed_out: bool | None = None
+
+    def to_wire(self) -> JsonObject:
+        return {
+            "id": self.id,
+            "question": self.question,
+            "options": list(self.options),
+            "multi": self.multi,
+            "selectedOptions": list(self.selected_options),
+            **({"customInput": self.custom_input} if self.custom_input is not None else {}),
+            **({"note": self.note} if self.note is not None else {}),
+            **({"timedOut": self.timed_out} if self.timed_out is not None else {}),
+        }
+
+
+@dataclass(slots=True, frozen=True)
+class AskDialogSubmitResult:
+    results: tuple[AskDialogResultItem, ...]
+    kind: Literal["submit"] = "submit"
+
+    def to_wire(self) -> JsonObject:
+        return {"kind": "submit", "results": [result.to_wire() for result in self.results]}
+
+
+@dataclass(slots=True, frozen=True)
+class AskDialogChatResult:
+    kind: Literal["chat"] = "chat"
+
+    def to_wire(self) -> JsonObject:
+        return {"kind": "chat"}
+
+
+AskDialogResult: TypeAlias = AskDialogSubmitResult | AskDialogChatResult
+
+
+@dataclass(slots=True, frozen=True)
+class ApprovalRequest:
+    id: str
+    session_id: str
+    tool_call_id: str
+    tool_name: str
+    approval_mode: ApprovalMode
+    tier: Literal["read", "write", "exec"]
+    arguments: JsonValue
+    details: tuple[str, ...]
+    provider_safety_checks: tuple[str, ...]
+    allowed_decisions: tuple[ApprovalDecision, ...]
+    reason: str | None = None
+    type: Literal["approval_request"] = "approval_request"
+
+
+@dataclass(slots=True, frozen=True)
+class ApprovalResolved:
+    id: str
+    outcome: ApprovalOutcome
+    decision: ApprovalDecision | None = None
+    type: Literal["approval_resolved"] = "approval_resolved"
+
+
+@dataclass(slots=True, frozen=True)
+class AskResolved:
+    id: str
+    outcome: AskOutcome
+    result: AskDialogResult | None = None
+    method: Literal["ask"] = "ask"
+    type: Literal["extension_ui_resolved"] = "extension_ui_resolved"
 
 
 @dataclass(slots=True, frozen=True)
@@ -972,6 +1257,7 @@ class ExtensionUiRequest:
     url: str | None = None
     launch_url: str | None = None
     instructions: str | None = None
+    questions: tuple[AskDialogQuestion, ...] | None = None
     type: Literal["extension_ui_request"] = "extension_ui_request"
 
     def is_passive(self) -> bool:
@@ -1134,6 +1420,31 @@ class TodoReminderEvent:
 class TodoAutoClearEvent:
     type: Literal["todo_auto_clear"] = "todo_auto_clear"
 
+@dataclass(slots=True, frozen=True)
+class FollowUpQueuedEvent:
+    client_turn_id: str
+    option_fingerprint: str
+    queue_position: int
+    type: Literal["follow_up_queued"] = "follow_up_queued"
+
+
+@dataclass(slots=True, frozen=True)
+class HostTurnPromotedEvent:
+    client_turn_id: str
+    option_fingerprint: str
+    model: str
+    thinking_level: str | None = None
+    fast_mode: bool | None = None
+    type: Literal["host_turn_promoted"] = "host_turn_promoted"
+
+
+@dataclass(slots=True, frozen=True)
+class HostTurnCancelledEvent:
+    client_turn_id: str
+    outcome: Literal["cancelled", "aborted"]
+    reason: str | None = None
+    type: Literal["host_turn_cancelled"] = "host_turn_cancelled"
+
 
 @dataclass(slots=True, frozen=True)
 class UnknownNotification:
@@ -1162,11 +1473,17 @@ RpcAgentEvent: TypeAlias = (
     | TtsrTriggeredEvent
     | TodoReminderEvent
     | TodoAutoClearEvent
+    | FollowUpQueuedEvent
+    | HostTurnPromotedEvent
+    | HostTurnCancelledEvent
 )
 
 RpcNotification: TypeAlias = (
     ReadyEvent
+    | ApprovalRequest
+    | ApprovalResolved
     | ExtensionUiRequest
+    | AskResolved
     | ExtensionError
     | RpcAgentEvent
     | UnknownNotification
@@ -1281,6 +1598,128 @@ def _parse_thinking_config(payload: object) -> ThinkingConfig | None:
     )
 
 
+def parse_semantic_capabilities(payload: object) -> SemanticCapabilities:
+    if payload is None:
+        return SemanticCapabilities()
+    raw = _clone_json_object(payload, field="capabilities")
+    parsed: dict[str, int] = {}
+    for wire_name, _attribute_name in _SEMANTIC_CAPABILITY_FIELDS:
+        revision = raw.get(wire_name)
+        if revision is None:
+            continue
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision <= 0:
+            raise ValueError(f"capabilities.{wire_name} must be a positive integer")
+        parsed[wire_name] = revision
+    return SemanticCapabilities(
+        structured_approvals=parsed.get("structuredApprovals"),
+        runtime_policy=parsed.get("runtimePolicy"),
+        auth_status=parsed.get("authStatus"),
+        rich_user_input=parsed.get("richUserInput"),
+        plan_control=parsed.get("planControl"),
+        plan_review=parsed.get("planReview"),
+        host_turns=parsed.get("hostTurns"),
+        model_catalog=parsed.get("modelCatalog"),
+        slash_commands=parsed.get("slashCommands"),
+        skills=parsed.get("skills"),
+        tasks=parsed.get("tasks"),
+        subagents=parsed.get("subagents"),
+    )
+
+
+def parse_runtime_policy(payload: JsonObject) -> RuntimePolicy:
+    return RuntimePolicy(
+        approval_mode=cast(
+            ApprovalMode,
+            _require_literal(
+                payload.get("approvalMode"),
+                _APPROVAL_MODE_VALUES,
+                field="approvalMode",
+            ),
+        )
+    )
+
+
+def parse_auth_status(payload: JsonObject) -> AuthStatus:
+    raw_providers = payload.get("providers")
+    if not isinstance(raw_providers, list):
+        raise ValueError("authStatus.providers must be a list")
+    providers: list[AuthProviderStatus] = []
+    for provider_index, raw_provider in enumerate(raw_providers):
+        provider = _clone_json_object(
+            raw_provider, field=f"authStatus.providers[{provider_index}]"
+        )
+        raw_accounts = provider.get("accounts")
+        if not isinstance(raw_accounts, list):
+            raise ValueError(
+                f"authStatus.providers[{provider_index}].accounts must be a list"
+            )
+        accounts: list[AuthAccountStatus] = []
+        for account_index, raw_account in enumerate(raw_accounts):
+            account = _clone_json_object(
+                raw_account,
+                field=(
+                    f"authStatus.providers[{provider_index}].accounts[{account_index}]"
+                ),
+            )
+            account_type = _require_literal(
+                account.get("type"),
+                _AUTH_ACCOUNT_TYPE_VALUES,
+                field="authAccount.type",
+            )
+            accounts.append(
+                AuthAccountStatus(
+                    type=cast(Literal["api_key", "oauth"], account_type),
+                    status=cast(
+                        Literal["authenticated", "expired", "error"],
+                        _require_literal(
+                            account.get("status"),
+                            _AUTH_ACCOUNT_STATUS_VALUES,
+                            field="authAccount.status",
+                        ),
+                    ),
+                    account_id=_optional_str(account, "accountId"),
+                    email=_optional_str(account, "email"),
+                    project_id=_optional_str(account, "projectId"),
+                    enterprise_url=_optional_str(account, "enterpriseUrl"),
+                    org_id=_optional_str(account, "orgId"),
+                    org_name=_optional_str(account, "orgName"),
+                )
+            )
+        providers.append(
+            AuthProviderStatus(
+                provider=_require_str(provider, "provider"),
+                status=cast(
+                    AuthStatusValue,
+                    _require_literal(
+                        provider.get("status"),
+                        _AUTH_STATUS_VALUES,
+                        field="authProvider.status",
+                    ),
+                ),
+                accounts=tuple(accounts),
+                error=_optional_str(provider, "error"),
+            )
+        )
+    return AuthStatus(providers=tuple(providers))
+
+
+def parse_available_skills(payload: JsonObject) -> tuple[AvailableSkill, ...]:
+    raw_skills = payload.get("skills")
+    if not isinstance(raw_skills, list):
+        raise ValueError("skills must be a list")
+    return tuple(
+        AvailableSkill(
+            name=_require_str(skill, "name"),
+            description=_require_str(skill, "description"),
+            source=_require_str(skill, "source"),
+        )
+        for index, raw_skill in enumerate(raw_skills)
+        for skill in [
+            _clone_json_object(raw_skill, field=f"skills[{index}]")
+        ]
+    )
+
+
 def parse_model_info(payload: JsonObject | None) -> ModelInfo | None:
     if payload is None:
         return None
@@ -1323,6 +1762,27 @@ def parse_model_info(payload: JsonObject | None) -> ModelInfo | None:
         priority=int(payload["priority"]) if "priority" in payload else None,
         thinking=_parse_thinking_config(thinking_payload),
         compat=_optional_json_object(compat_payload, field="model.compat"),
+        thinking_efforts=cast(
+            tuple[Effort, ...] | None,
+            tuple(
+                cast(
+                    Effort,
+                    _require_literal(
+                        effort, _EFFORT_VALUES, field="model.thinkingEfforts[]"
+                    ),
+                )
+                for effort in (
+                    _tuple_of_strings(
+                        payload.get("thinkingEfforts"),
+                        field="model.thinkingEfforts",
+                    )
+                    or ()
+                )
+            )
+            if payload.get("thinkingEfforts") is not None
+            else None,
+        ),
+        fast_mode_supported=_optional_bool(payload, "fastModeSupported"),
     )
 
 
@@ -1425,6 +1885,14 @@ def parse_session_state(payload: JsonObject) -> SessionState:
         auto_compaction_enabled=bool(payload.get("autoCompactionEnabled", False)),
         message_count=int(payload.get("messageCount", 0)),
         queued_message_count=int(payload.get("queuedMessageCount", 0)),
+        approval_mode=cast(
+            ApprovalMode | None,
+            _optional_literal(
+                payload.get("approvalMode"),
+                _APPROVAL_MODE_VALUES,
+                field="approvalMode",
+            ),
+        ),
         todo_phases=parse_todo_phases(
             cast(JsonValue | None, payload.get("todoPhases"))
         ),
@@ -1501,6 +1969,73 @@ def parse_thinking_level_cycle_result(
 def parse_cancellation_result(payload: JsonObject | None) -> CancellationResult:
     return CancellationResult(cancelled=bool((payload or {}).get("cancelled", False)))
 
+def parse_host_turn_boundary(payload: JsonObject) -> HostTurnBoundary:
+    raw_identity = payload.get("nativeIdentity")
+    native_identity: HostTurnNativeIdentity | None = None
+    if raw_identity is not None:
+        identity = _clone_json_object(raw_identity, field="nativeIdentity")
+        native_identity = HostTurnNativeIdentity(
+            session_id=_require_str(identity, "sessionId"),
+            entry_id=_optional_str(identity, "entryId"),
+            session_file=_optional_str(identity, "sessionFile"),
+        )
+    lineage = _clone_json_object(payload.get("lineage"), field="lineage")
+    raw_outcome = payload.get("outcome")
+    outcome = (
+        None
+        if raw_outcome is None
+        else cast(
+            HostTurnOutcome,
+            _require_literal(raw_outcome, _HOST_TURN_OUTCOME_VALUES, field="outcome"),
+        )
+    )
+    return HostTurnBoundary(
+        client_turn_id=_require_str(payload, "clientTurnId"),
+        kind=cast(
+            HostTurnKind,
+            _require_literal(payload.get("kind"), _HOST_TURN_KIND_VALUES, field="kind"),
+        ),
+        payload_fingerprint=_require_str(payload, "payloadFingerprint"),
+        status=cast(
+            HostTurnOperationStatus,
+            _require_literal(payload.get("status"), _HOST_TURN_STATUS_VALUES, field="status"),
+        ),
+        prepared_at=_require_str(payload, "preparedAt"),
+        lineage=HostTurnLineage(
+            session_id=_require_str(lineage, "sessionId"),
+            session_file=_optional_str(lineage, "sessionFile"),
+            parent_session_id=_optional_str(lineage, "parentSessionId"),
+            parent_session_file=_optional_str(lineage, "parentSessionFile"),
+        ),
+        operation_id=_require_str(payload, "operationId"),
+        prepared_entry_id=_require_str(payload, "preparedEntryId"),
+        outcome=outcome,
+        dispatched_at=_optional_str(payload, "dispatchedAt"),
+        settled_at=_optional_str(payload, "settledAt"),
+        native_identity=native_identity,
+    )
+
+
+def parse_host_turns(payload: JsonObject | None) -> tuple[HostTurnBoundary, ...]:
+    turns = (payload or {}).get("turns") or []
+    if not isinstance(turns, list):
+        raise ValueError("turns must be a list")
+    return tuple(
+        parse_host_turn_boundary(_clone_json_object(turn, field="turns[]"))
+        for turn in turns
+    )
+
+
+def parse_host_turn_rollback_result(payload: JsonObject) -> HostTurnRollbackResult:
+    return HostTurnRollbackResult(
+        removed_client_turn_ids=_require_string_tuple(
+            payload.get("removedClientTurnIds"), field="removedClientTurnIds"
+        ),
+        turns=parse_host_turns(payload),
+        session_id=_require_str(payload, "sessionId"),
+        session_file=_optional_str(payload, "sessionFile"),
+    )
+
 
 def parse_branch_result(payload: JsonObject | None) -> BranchResult:
     payload = payload or {}
@@ -1559,17 +2094,179 @@ def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
     )
 
 
-def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
-    return ExtensionUiRequest(
+def parse_ask_dialog_option(payload: JsonObject) -> AskDialogOption:
+    return AskDialogOption(
+        label=_require_str(payload, "label"),
+        description=_optional_str(payload, "description"),
+        preview=_optional_str(payload, "preview"),
+    )
+
+
+def parse_ask_dialog_question(payload: JsonObject) -> AskDialogQuestion:
+    raw_options = payload.get("options")
+    if not isinstance(raw_options, list):
+        raise ValueError("ask.question.options must be a list")
+    return AskDialogQuestion(
         id=_require_str(payload, "id"),
-        method=cast(
-            ExtensionUiMethod,
+        question=_require_str(payload, "question"),
+        header=_optional_str(payload, "header"),
+        options=tuple(
+            parse_ask_dialog_option(
+                _clone_json_object(option, field="ask.question.options[]")
+            )
+            for option in raw_options
+        ),
+        multi=_optional_bool(payload, "multi"),
+        recommended=_optional_int(payload, "recommended"),
+        allow_custom=_optional_bool(payload, "allowCustom"),
+    )
+
+
+def parse_ask_dialog_result_item(payload: JsonObject) -> AskDialogResultItem:
+    return AskDialogResultItem(
+        id=_require_str(payload, "id"),
+        question=_require_str(payload, "question"),
+        options=_require_string_tuple(payload.get("options"), field="ask.result.options"),
+        multi=_require_bool(payload, "multi"),
+        selected_options=_require_string_tuple(
+            payload.get("selectedOptions"), field="ask.result.selectedOptions"
+        ),
+        custom_input=_optional_str(payload, "customInput"),
+        note=_optional_str(payload, "note"),
+        timed_out=_optional_bool(payload, "timedOut"),
+    )
+
+
+def parse_ask_dialog_result(payload: JsonObject) -> AskDialogResult:
+    kind = payload.get("kind")
+    if kind == "chat":
+        return AskDialogChatResult()
+    if kind != "submit":
+        raise ValueError("ask result kind must be submit or chat")
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list):
+        raise ValueError("ask result results must be a list")
+    return AskDialogSubmitResult(
+        results=tuple(
+            parse_ask_dialog_result_item(
+                _clone_json_object(result, field="ask.result.results[]")
+            )
+            for result in raw_results
+        )
+    )
+
+
+def parse_approval_request(payload: JsonObject) -> ApprovalRequest:
+    raw_decisions = _require_string_tuple(
+        payload.get("allowedDecisions"), field="approval.allowedDecisions"
+    )
+    return ApprovalRequest(
+        id=_require_str(payload, "id"),
+        session_id=_require_str(payload, "sessionId"),
+        tool_call_id=_require_str(payload, "toolCallId"),
+        tool_name=_require_str(payload, "toolName"),
+        approval_mode=cast(
+            ApprovalMode,
             _require_literal(
-                payload.get("method"),
-                _EXTENSION_UI_METHOD_VALUES,
-                field="extension_ui_request.method",
+                payload.get("approvalMode"),
+                _APPROVAL_MODE_VALUES,
+                field="approval.approvalMode",
             ),
         ),
+        tier=cast(
+            Literal["read", "write", "exec"],
+            _require_literal(
+                payload.get("tier"),
+                _APPROVAL_TIER_VALUES,
+                field="approval.tier",
+            ),
+        ),
+        arguments=_clone_json_value(payload.get("arguments"), field="approval.arguments"),
+        reason=_optional_str(payload, "reason"),
+        details=_require_string_tuple(payload.get("details"), field="approval.details"),
+        provider_safety_checks=_require_string_tuple(
+            payload.get("providerSafetyChecks"),
+            field="approval.providerSafetyChecks",
+        ),
+        allowed_decisions=tuple(
+            cast(
+                ApprovalDecision,
+                _require_literal(
+                    decision,
+                    _APPROVAL_DECISION_VALUES,
+                    field="approval.allowedDecisions[]",
+                ),
+            )
+            for decision in raw_decisions
+        ),
+    )
+
+
+def parse_approval_resolved(payload: JsonObject) -> ApprovalResolved:
+    return ApprovalResolved(
+        id=_require_str(payload, "id"),
+        outcome=cast(
+            ApprovalOutcome,
+            _require_literal(
+                payload.get("outcome"),
+                _APPROVAL_OUTCOME_VALUES,
+                field="approval.outcome",
+            ),
+        ),
+        decision=cast(
+            ApprovalDecision | None,
+            _optional_literal(
+                payload.get("decision"),
+                _APPROVAL_DECISION_VALUES,
+                field="approval.decision",
+            ),
+        ),
+    )
+
+
+def parse_ask_resolved(payload: JsonObject) -> AskResolved:
+    raw_result = payload.get("result")
+    return AskResolved(
+        id=_require_str(payload, "id"),
+        outcome=cast(
+            AskOutcome,
+            _require_literal(
+                payload.get("outcome"),
+                _ASK_OUTCOME_VALUES,
+                field="ask.outcome",
+            ),
+        ),
+        result=parse_ask_dialog_result(
+            _clone_json_object(raw_result, field="ask.result")
+        )
+        if raw_result is not None
+        else None,
+    )
+
+
+def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
+    method = cast(
+        ExtensionUiMethod,
+        _require_literal(
+            payload.get("method"),
+            _EXTENSION_UI_METHOD_VALUES,
+            field="extension_ui_request.method",
+        ),
+    )
+    questions: tuple[AskDialogQuestion, ...] | None = None
+    if method == "ask":
+        raw_questions = payload.get("questions")
+        if not isinstance(raw_questions, list):
+            raise ValueError("extension_ui_request.questions must be a list")
+        questions = tuple(
+            parse_ask_dialog_question(
+                _clone_json_object(question, field="extension_ui_request.questions[]")
+            )
+            for question in raw_questions
+        )
+    return ExtensionUiRequest(
+        id=_require_str(payload, "id"),
+        method=method,
         title=_optional_str(payload, "title"),
         options=_tuple_of_strings(
             payload.get("options"), field="extension_ui_request.options"
@@ -1609,8 +2306,8 @@ def parse_extension_ui_request(payload: JsonObject) -> ExtensionUiRequest:
         url=_optional_str(payload, "url"),
         launch_url=_optional_str(payload, "launchUrl"),
         instructions=_optional_str(payload, "instructions"),
+        questions=questions,
     )
-
 
 def parse_extension_error(payload: JsonObject) -> ExtensionError:
     return ExtensionError(
@@ -1639,11 +2336,49 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             max_reassembled_frame_bytes=_optional_int(
                 payload, "maxReassembledFrameBytes"
             ),
+            capabilities=parse_semantic_capabilities(payload.get("capabilities"))
+            if "capabilities" in payload
+            else None,
         )
+    if event_type == "approval_request":
+        return parse_approval_request(payload)
+    if event_type == "approval_resolved":
+        return parse_approval_resolved(payload)
+    if event_type == "extension_ui_resolved":
+        if payload.get("method") == "ask":
+            return parse_ask_resolved(payload)
+        return UnknownNotification(_clone_json_object(payload, field="notification"))
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type == "follow_up_queued":
+        return FollowUpQueuedEvent(
+            client_turn_id=_require_str(payload, "clientTurnId"),
+            option_fingerprint=_require_str(payload, "optionFingerprint"),
+            queue_position=_require_int(payload, "queuePosition"),
+        )
+    if event_type == "host_turn_promoted":
+        return HostTurnPromotedEvent(
+            client_turn_id=_require_str(payload, "clientTurnId"),
+            option_fingerprint=_require_str(payload, "optionFingerprint"),
+            model=_require_str(payload, "model"),
+            thinking_level=_optional_str(payload, "thinkingLevel"),
+            fast_mode=_optional_bool(payload, "fastMode"),
+        )
+    if event_type == "host_turn_cancelled":
+        return HostTurnCancelledEvent(
+            client_turn_id=_require_str(payload, "clientTurnId"),
+            outcome=cast(
+                Literal["cancelled", "aborted"],
+                _require_literal(
+                    payload.get("outcome"),
+                    frozenset({"cancelled", "aborted"}),
+                    field="host_turn_cancelled.outcome",
+                ),
+            ),
+            reason=_optional_str(payload, "reason"),
+        )
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":

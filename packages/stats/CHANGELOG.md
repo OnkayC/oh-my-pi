@@ -18,6 +18,10 @@
 ### Fixed
 
 - Fixed an issue in subscription-window insights where distinct limits sharing a duration label (such as Anthropic overall vs. model-scoped 7-day windows) were incorrectly merged, which inflated window-equivalents and skewed tokens-per-window estimates. Windows are now grouped by provider limit ID.
+### Fixed
+
+- Rejected malformed and out-of-range `--port` values in the standalone stats CLI instead of coercing them with `parseInt`.
+
 
 ## [17.3.6] - 2026-08-17
 
