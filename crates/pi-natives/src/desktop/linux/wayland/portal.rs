@@ -36,9 +36,17 @@ const ORPHANED_REMOTE_DESKTOP_TOKEN: &str = "remote-desktop-token";
 /// Resolves the `omp` state directory (`$XDG_STATE_HOME/omp` or
 /// `~/.local/state/omp`) that holds portal tokens.
 fn omp_state_dir() -> Option<PathBuf> {
+	// Empty env values (common in sandboxes) must not win over fallbacks:
+	// PathBuf::from("") is a relative path that would write portal tokens into the
+	// wrong tree.
 	let base = std::env::var_os("XDG_STATE_HOME")
+		.filter(|value| !value.is_empty())
 		.map(PathBuf::from)
-		.or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
+		.or_else(|| {
+			std::env::var_os("HOME")
+				.filter(|value| !value.is_empty())
+				.map(|home| PathBuf::from(home).join(".local/state"))
+		})?;
 	Some(base.join("omp"))
 }
 

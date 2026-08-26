@@ -17,6 +17,7 @@ Primary implementation:
 
 ```bash
 omp --mode rpc [regular CLI options]
+omp --mode rpc-ui [regular CLI options]
 ```
 
 Behavior notes:
@@ -25,13 +26,15 @@ Behavior notes:
 - RPC mode disables automatic session title generation by default to avoid an extra model call.
 - RPC/ACP host defaults cover task isolation/execution, memory, advisor, tier, async-job, and bash auto-background settings. They are applied only when a path is not explicitly configured; project/global config, `--config`, and isolated settings remain authoritative. Todo settings are not host-defaulted.
 - The process claims stdin before extension discovery, then parses it one non-empty JSONL line at a time. Malformed JSON emits a recoverable `command: "parse"` failure and does not terminate the loop.
-- At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions and transport limits.
+- At startup it writes a `ready` frame before processing commands. The frame advertises supported protocol versions, transport limits, and implemented semantic capability revisions. `rpc-ui` enables native approval, rich-input, and plan-review requests; it is not ACP.
 - When stdin closes, pending extension UI, host-tool, and host-URI requests are rejected; accepted commands are drained, the session is disposed, and the process exits with code `0`.
 - Responses/events are written as one JSON object per line.
 
 ## Transport and Framing
 
-Protocol v1 stdout frames are a single JSON object followed by `\n`. The server caps each physical stdout frame at 1 MiB. Inbound commands are always one unchunked JSONL object; clients SHOULD keep them within the advertised physical-frame limit.
+Protocol v1 commands and stdout frames are a single JSON object followed by `\n`, capped at 1 MiB
+per physical frame. After protocol v2 negotiation, either peer may send an oversized logical object
+as an uninterrupted `rpc_chunk` sequence, up to the advertised 64 MiB reassembly limit.
 
 The initial ready frame uses protocol v1 and advertises the opt-in lossless transport:
 
@@ -51,7 +54,9 @@ Clients that support protocol v2 SHOULD immediately send:
 { "id": "protocol-1", "type": "negotiate_protocol", "protocolVersion": 2 }
 ```
 
-After the success response, oversized stdout objects are emitted losslessly as an uninterrupted sequence of `rpc_chunk` frames. Each chunk carries a base64 segment of the original UTF-8 JSON object:
+After the success response, oversized logical objects in either direction are transmitted losslessly
+as an uninterrupted sequence of `rpc_chunk` frames. Each chunk carries a base64 segment of the
+original UTF-8 JSON object:
 
 ```json
 {
@@ -64,9 +69,39 @@ After the success response, oversized stdout objects are emitted losslessly as a
 }
 ```
 
-Clients MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject interleaved or interrupted sequences, enforce the advertised reassembly limit, concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one JSON object. The TypeScript `RpcFrameDecoder`, exported from `@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript and Python `RpcClient` implementations negotiate v2 automatically when the ready frame advertises it.
+Both peers MUST validate `chunkId`, `index`, `count`, and `byteLength`, reject pre-negotiation,
+interleaved, or interrupted sequences, enforce the advertised physical and reassembly limits,
+concatenate decoded bytes in index order, decode them as strict UTF-8, and parse the result as one
+JSON object. The TypeScript `RpcFrameDecoder`, exported from
+`@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame`, implements this validation. The bundled TypeScript
+and Python `RpcClient` implementations negotiate v2 automatically when the ready frame advertises
+it.
 
 Legacy clients may ignore the added ready fields and remain on v1. V1 retains its bounded fallback behavior for oversized output. Frames above the v2 reassembly ceiling still fail explicitly; large history APIs should use pagination rather than depending on arbitrarily large logical frames.
+
+### Semantic capability negotiation
+
+Semantic revisions are negotiated separately from transport v1/v2. A current ready frame may
+advertise revision `1` for `structuredApprovals`, `runtimePolicy`, `authStatus`, `richUserInput`,
+`planControl`, `planReview`, `hostTurns`, `modelCatalog`, `slashCommands`, `skills`, `tasks`, and
+`subagents`.
+
+Clients select only offered revisions:
+
+```json
+{
+  "id": "capabilities-1",
+  "type": "negotiate_capabilities",
+  "capabilities": {
+    "structuredApprovals": 1,
+    "richUserInput": 1,
+    "planControl": 1
+  }
+}
+```
+
+The response returns the selected map. Semantic frames are emitted only after their capability is
+selected. Legacy clients may ignore `ready.capabilities` and retain the existing generic UI behavior.
 
 ### Outbound frame categories (stdout)
 
@@ -110,9 +145,10 @@ Important edge behavior from runtime:
 
 ### Prompting
 
-- `{ id?, type: "prompt", message: string, images?: ImageContent[], streamingBehavior?: "steer" | "followUp" }`
+- `{ id?, type: "prompt", message: string, images?: ImageContent[], clientTurnId?: string, streamingBehavior?: "steer" | "followUp" }`
 - `{ id?, type: "steer", message: string, images?: ImageContent[] }`
 - `{ id?, type: "follow_up", message: string, images?: ImageContent[] }`
+- `{ id?, type: "follow_up", message: string, images?: ImageContent[], clientTurnId: string, optionFingerprint: string, turnOptions?: { provider?: string, modelId: string, thinkingLevel?: string, fastMode?: boolean } }`
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
 - `{ id?, type: "new_session", parentSession?: string }`
@@ -120,6 +156,7 @@ Important edge behavior from runtime:
 ### Protocol
 
 - `{ id?, type: "negotiate_protocol", protocolVersion: 2 }`
+- `{ id?, type: "negotiate_capabilities", capabilities: RpcSemanticCapabilities }`
 
 ### State
 
@@ -132,6 +169,13 @@ Important edge behavior from runtime:
 - `{ id?, type: "set_subagent_subscription", level: "off" | "progress" | "events" }`
 - `{ id?, type: "get_subagents" }`
 - `{ id?, type: "get_subagent_messages", subagentId?: string, sessionFile?: string, fromByte?: number }`
+- `{ id?, type: "set_runtime_policy", approvalMode: "always-ask" | "write" | "yolo" }`
+- `{ id?, type: "get_auth_status" }`
+- `{ id?, type: "get_available_skills" }`
+
+`get_available_models` includes provider/model identity, context and input support, reasoning,
+supported thinking efforts, and fast-mode support. Authentication results expose status and account
+metadata but never credentials.
 
 ### Model
 
@@ -182,6 +226,22 @@ correlate it via `id`. Ordering across concurrent commands is not guaranteed
 - `{ id?, type: "get_last_assistant_text" }`
 - `{ id?, type: "set_session_name", name: string }`
 - `{ id?, type: "handoff", customInstructions?: string }`
+
+### Plan mode and host turns
+
+- `{ id?, type: "set_plan_mode", status: "off" | "active" | "paused", workflow?: "parallel" | "iterative", planFilePath?: string }`
+- `{ id?, type: "respond_to_plan_review", requestId: string, decision: RpcPlanReviewDecision }`
+- `{ id?, type: "get_turns" }`
+- `{ id?, type: "rollback_turns", count: number, expectedClientTurnIds: string[] }`
+
+Plan review decisions execute with fresh, preserved, or compacted context; refine with feedback; or
+cancel. Execute/refine decisions carry a stable `clientTurnId` and may choose an execution model or
+replacement plan markdown. Pending review state and plan digests persist across process restart.
+
+Every ordinary prompt, promoted follow-up, plan refinement, and plan execution uses a durable
+`host_turn_operation` journal. `get_turns` returns the chronological host boundaries.
+`rollback_turns` is idle-only and atomically validates the exact expected T3 suffix before changing
+history; divergent, excessive, fractional, negative, or busy requests fail without mutation.
 
 ### Messages
 
@@ -485,6 +545,10 @@ Common event types:
 - `ttsr_triggered`
 - `todo_reminder`, `todo_auto_clear`
 - `irc_message`, `notice`, `goal_updated`
+- `follow_up_queued`, `host_turn_promoted`, `host_turn_cancelled`
+- `approval_request`, `approval_resolved`
+- `extension_ui_resolved`
+- `plan_mode_changed`, `plan_review_request`, `plan_review_resolved`
 
 Extension runner errors are emitted separately as:
 
@@ -580,6 +644,20 @@ From `packages/agent/src/agent.ts` defaults:
   - `"immediate"`: tool execution checks steering between tool calls; pending steering can abort remaining tool calls in the turn
   - `"wait"`: defer steering until turn completion
 
+## Structured Approval And Plan Review
+
+When `structuredApprovals` is selected, OMP emits `approval_request` with request/session/tool-call
+IDs, tool name, arguments, approval mode, tier, reason, details, provider safety checks, and the exact
+allowed decisions. Hosts respond with `approval_response` using `approve_once`, `approve_session`,
+`deny`, or `cancel`. OMP then emits the authoritative `approval_resolved`; a response write alone is
+not completion. Session grants are scoped to the current session and tool name, and are never reused
+for provider safety checks.
+
+When `planReview` is selected, OMP emits `plan_review_request` with the artifact, allowed context
+strategies, context usage, model choices, and stable request ID. `respond_to_plan_review` is durable
+and idempotent. `plan_review_resolved` reports executing, refining, cancelled, stale, aborted, or
+process-exited outcomes.
+
 ## Extension UI Sub-Protocol
 
 Extensions in RPC mode use request/response UI frames.
@@ -588,7 +666,7 @@ Extensions in RPC mode use request/response UI frames.
 
 `RpcExtensionUIRequest` (`type: "extension_ui_request"`) methods:
 
-- `select`, `confirm`, `input`, `editor`, `cancel`
+- `select`, `confirm`, `input`, `editor`, `ask`, `cancel`
   - `select` keeps labels in `options: string[]` and, when any option has a
     description, emits a positionally aligned
     `optionDetails: Array<{ description?: string }>` array. Hosts that do not
@@ -622,9 +700,13 @@ Example:
 
 - `{ type: "extension_ui_response", id: string, value: string }`
 - `{ type: "extension_ui_response", id: string, confirmed: boolean }`
+- `{ type: "extension_ui_response", id: string, result: { kind: "submit", results: ExtensionAskDialogResultItem[] } | { kind: "chat" } }`
 - `{ type: "extension_ui_response", id: string, cancelled: true, timedOut?: boolean }`
 
-If a dialog has a timeout, RPC mode resolves to a default value when timeout/abort fires.
+Rich `ask` requests preserve multiple questions, previews, recommendations, multi-select, custom
+input, notes, timeout, chat redirect, and cancellation. OMP emits authoritative
+`extension_ui_resolved` outcomes for submitted, chat, cancelled, timed-out, stale, and aborted asks.
+Legacy select/input fallback remains available only when `richUserInput` was not selected.
 
 ## Host Tool Sub-Protocol
 

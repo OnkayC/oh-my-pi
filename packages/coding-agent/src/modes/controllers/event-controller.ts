@@ -284,6 +284,9 @@ export class EventController {
 				this.ctx.ui.requestRender(true);
 			},
 			goal_updated: async () => {},
+			follow_up_queued: async () => {},
+			host_turn_promoted: async () => {},
+			host_turn_cancelled: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}
 

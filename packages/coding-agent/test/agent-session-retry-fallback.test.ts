@@ -3084,11 +3084,15 @@ describe("AgentSession retry fallback", () => {
 		// The superseded first attempt is aggregated onto the terminal event so
 		// the transcript renders one budget-labeled error, not per-attempt rows.
 		expect(retryEndEvents[0]?.retryErrors).toHaveLength(1);
-		expect(retryEndEvents[0]?.retryErrors?.[0]?.retryRecovery).toMatchObject({
-			kind: "auto-retry",
-			recovery: "model",
-			status: "superseded",
-			attempt: 1,
+		expect(retryEndEvents[0]?.retryErrors?.[0]).toMatchObject({
+			note: "switched model; retried",
+			retryRecovery: {
+				attempt: 1,
+				kind: "auto-retry",
+				note: "switched model; retried",
+				recovery: "model",
+				status: "superseded",
+			},
 		});
 	});
 

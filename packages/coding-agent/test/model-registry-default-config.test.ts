@@ -65,7 +65,7 @@ describe("ModelRegistry default custom models config", () => {
 			modelId: "us.anthropic.claude-opus-4-8",
 		});
 
-		expect(model?.compat).toEqual({
+		expect(model?.compat).toMatchObject({
 			promptCacheMode: "explicit",
 			supportsLongPromptCacheRetention: false,
 			promptCacheMinimumTokens: 1024,

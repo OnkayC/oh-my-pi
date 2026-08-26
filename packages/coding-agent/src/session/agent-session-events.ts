@@ -62,7 +62,27 @@ export type AgentSessionEvent =
 			/** The level `auto` resolved to this turn, once classified. */
 			resolved?: Effort;
 	  }
-	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
+	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState }
+	| {
+			type: "follow_up_queued";
+			clientTurnId: string;
+			optionFingerprint: string;
+			queuePosition: number;
+	  }
+	| {
+			type: "host_turn_promoted";
+			clientTurnId: string;
+			optionFingerprint: string;
+			model: string;
+			thinkingLevel?: string;
+			fastMode?: boolean;
+	  }
+	| {
+			type: "host_turn_cancelled";
+			clientTurnId: string;
+			outcome: "cancelled" | "aborted";
+			reason?: string;
+	  };
 
 /** Listener function for agent session events. */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
