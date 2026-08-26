@@ -1,8 +1,8 @@
-name: Warm darwin Bazel cache
+name: Warm release Bazel cache
 
-# Darwin release builds compile their own native addon and are the longest
-# release leg. Keep that hosted-runner cache near main so a tag build processes
-# only the source/version delta instead of rebuilding the full toolchain graph.
+# Release binaries compile their own native addons. Keep those hosted-runner
+# caches near main so a tag build processes only the source/version delta
+# instead of rebuilding the full toolchain graph.
 
 on:
    push:
@@ -32,13 +32,15 @@ concurrency:
    cancel-in-progress: false
 
 jobs:
-   warm_darwin:
-      name: "Seed darwin release bazel cache: ${{ matrix.target }}"
+   warm:
+      name: "Seed release bazel cache: ${{ matrix.target }}"
       strategy:
          fail-fast: false
          matrix:
             include:
                - { os: macos-14, target: darwin-arm64, scope: release-darwin-arm64 }
+               - { os: ubuntu-24.04, target: linux-x64-modern, scope: release-linux-x64 }
+               - { os: ubuntu-24.04-arm, target: linux-arm64, scope: release-linux-arm64 }
       runs-on: ${{ matrix.os }}
       steps:
          - uses: actions/checkout@v4
