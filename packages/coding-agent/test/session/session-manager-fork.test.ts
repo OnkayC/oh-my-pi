@@ -47,7 +47,23 @@ async function createSessionWithArtifacts(root: string): Promise<{
 	return { cwd, sessionDir, sourceFile, sourceArtifactsDir };
 }
 
-describe("SessionManager.forkFrom", () => {
+async function appendHostTurn(manager: SessionManager, clientTurnId: string, message: string): Promise<string> {
+	const prepared = await manager.prepareHostTurnOperation({ clientTurnId, kind: "prompt", payload: { message } });
+	const userEntryId = manager.appendMessage({ role: "user", content: message, timestamp: Date.now() });
+	await manager.markHostTurnDispatched({
+		clientTurnId,
+		payloadFingerprint: prepared.payloadFingerprint,
+		nativeIdentity: { sessionId: manager.getSessionId(), entryId: userEntryId },
+	});
+	const settled = await manager.settleHostTurnOperation({
+		clientTurnId,
+		payloadFingerprint: prepared.payloadFingerprint,
+		outcome: "completed",
+	});
+	return settled.journalEntryId;
+}
+
+describe("SessionManager forks", () => {
 	it("suppresses terminal breadcrumbs while preserving source history under a new parented session", async () => {
 		using tempDir = TempDir.createSync("@omp-session-fork-");
 		const previousAgentDir = getAgentDir();
@@ -102,6 +118,23 @@ describe("SessionManager.forkFrom", () => {
 			expect(cloneHeader?.cwd).toBe(cwd);
 			if (cloneMessage?.message.role !== "user") throw new Error("expected forked user message");
 			expect(cloneMessage.message.content).toBe("hello");
+
+			const prepared = await forked.prepareHostTurnOperation({
+				clientTurnId: "fork-turn",
+				kind: "prompt",
+				payload: { message: "fork-local" },
+			});
+			const forkMessageId = forked.appendMessage({
+				role: "user",
+				content: "fork-local",
+				timestamp: Date.now(),
+			});
+			await forked.markHostTurnDispatched({
+				clientTurnId: prepared.clientTurnId,
+				payloadFingerprint: prepared.payloadFingerprint,
+				nativeIdentity: { sessionId: forked.getSessionId(), entryId: forkMessageId },
+			});
+			expect((await forked.getHostTurns()).map(turn => turn.clientTurnId)).toEqual(["fork-turn"]);
 		} finally {
 			if (previousTermSessionId === undefined) {
 				delete process.env.TERM_SESSION_ID;
@@ -170,5 +203,93 @@ describe("SessionManager.forkFrom", () => {
 
 		expect(await Bun.file(path.join(forkArtifactsDir, "unrelated.txt")).exists()).toBe(false);
 		expect(await Bun.file(unrelatedFile).text()).toBe("must not be copied");
+	});
+
+	it("keeps copied branch host-turn history self-contained during rollback", async () => {
+		using tempDir = TempDir.createSync("@omp-session-branch-turns-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const branchPointId = await appendHostTurn(manager, "turn-1", "kept source turn");
+		await appendHostTurn(manager, "turn-2", "abandoned source turn");
+		await manager.flush();
+
+		const sourceFile = manager.getSessionFile();
+		if (!sourceFile) throw new Error("expected source session file");
+		const sourceBytes = await Bun.file(sourceFile).bytes();
+		const sourceEntries = await loadEntriesFromFile(sourceFile);
+
+		const branchFile = manager.createBranchedSession(branchPointId);
+		if (!branchFile) throw new Error("expected copied branch session file");
+		await appendHostTurn(manager, "turn-branch", "branch-only turn");
+
+		expect((await manager.getHostTurns()).map(turn => turn.clientTurnId)).toEqual(["turn-1", "turn-branch"]);
+		const rollback = await manager.rollbackHostTurns({
+			count: 1,
+			expectedClientTurnIds: ["turn-branch"],
+		});
+		expect(rollback.sessionFile).toBe(branchFile);
+		expect(rollback.removedClientTurnIds).toEqual(["turn-branch"]);
+		expect(rollback.remainingTurns.map(turn => turn.clientTurnId)).toEqual(["turn-1"]);
+		expect((await manager.getHostTurns()).map(turn => turn.clientTurnId)).toEqual(["turn-1"]);
+
+		expect(await Bun.file(sourceFile).bytes()).toEqual(sourceBytes);
+		expect(await loadEntriesFromFile(sourceFile)).toEqual(sourceEntries);
+	});
+
+	it("inherits host turns only from the persisted parent active branch", async () => {
+		using tempDir = TempDir.createSync("@omp-session-parent-branch-turns-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const branchPointId = await appendHostTurn(manager, "turn-root", "shared root turn");
+		await appendHostTurn(manager, "turn-abandoned", "abandoned parent turn");
+		manager.branch(branchPointId);
+		await appendHostTurn(manager, "turn-active", "active parent turn");
+		await manager.flush();
+
+		const parentFile = manager.getSessionFile();
+		if (!parentFile) throw new Error("expected parent session file");
+		await manager.newSession({ parentSession: parentFile });
+		await appendHostTurn(manager, "turn-child", "child turn");
+
+		expect((await manager.getHostTurns()).map(turn => turn.clientTurnId)).toEqual([
+			"turn-root",
+			"turn-active",
+			"turn-child",
+		]);
+	});
+
+	it("rejects rollback through an abandoned persisted parent branch", async () => {
+		using tempDir = TempDir.createSync("@omp-session-parent-rollback-");
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const branchPointId = await appendHostTurn(manager, "turn-root", "shared root turn");
+		await appendHostTurn(manager, "turn-abandoned", "abandoned parent turn");
+		manager.branch(branchPointId);
+		await appendHostTurn(manager, "turn-active", "active parent turn");
+		await manager.flush();
+
+		const parentFile = manager.getSessionFile();
+		if (!parentFile) throw new Error("expected parent session file");
+		const parentBytes = await Bun.file(parentFile).bytes();
+		await manager.newSession({ parentSession: parentFile });
+		await appendHostTurn(manager, "turn-child", "child turn");
+		await manager.flush();
+		const childFile = manager.getSessionFile();
+		if (!childFile) throw new Error("expected child session file");
+		const childBytes = await Bun.file(childFile).bytes();
+
+		await expect(
+			manager.rollbackHostTurns({
+				count: 3,
+				expectedClientTurnIds: ["turn-abandoned", "turn-active", "turn-child"],
+			}),
+		).rejects.toThrow("expectedClientTurnIds does not match the current host-turn suffix");
+		expect(await Bun.file(parentFile).bytes()).toEqual(parentBytes);
+		expect(await Bun.file(childFile).bytes()).toEqual(childBytes);
+
+		const rollback = await manager.rollbackHostTurns({
+			count: 1,
+			expectedClientTurnIds: ["turn-child"],
+		});
+		expect(rollback.removedClientTurnIds).toEqual(["turn-child"]);
+		expect(rollback.remainingTurns.map(turn => turn.clientTurnId)).toEqual(["turn-root", "turn-active"]);
+		expect(await Bun.file(parentFile).bytes()).toEqual(parentBytes);
 	});
 });

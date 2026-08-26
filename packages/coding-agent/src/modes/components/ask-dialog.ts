@@ -384,6 +384,7 @@ function normalizeDialogQuestions(questions: ExtensionAskDialogQuestion[]): Exte
 			options,
 			...(typeof q.multi === "boolean" ? { multi: q.multi } : {}),
 			...(Number.isInteger(q.recommended) ? { recommended: q.recommended } : {}),
+			...(typeof q.allowCustom === "boolean" ? { allowCustom: q.allowCustom } : {}),
 		});
 	}
 	return out;
@@ -632,7 +633,8 @@ export class AskDialogComponent implements Component {
 			label: this.#optionLabel(question, option.label, index),
 			optionIndex: index,
 		}));
-		rows.push({ kind: "other", key: "other", label: OTHER_OPTION, optionIndex: undefined });
+		if (question.allowCustom !== false)
+			rows.push({ kind: "other", key: "other", label: OTHER_OPTION, optionIndex: undefined });
 		return rows;
 	}
 

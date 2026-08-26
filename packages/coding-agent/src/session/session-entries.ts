@@ -40,6 +40,11 @@ export interface SessionHeader {
 	 */
 	additionalDirectories?: string[];
 	parentSession?: string;
+	/**
+	 * Active parent leaf ID captured when this child was created. Host-turn
+	 * lineage walks to this boundary instead of the parent's mutable current leaf.
+	 */
+	parentLeafId?: string;
 	/** Prior absolute JSONL locations recorded by successful session moves. */
 	previousSessionFiles?: string[];
 	/** Provider prompt-cache identity inherited by exact-route full forks. */
@@ -48,6 +53,8 @@ export interface SessionHeader {
 
 export interface NewSessionOptions {
 	parentSession?: string;
+	/** Parent leaf ID to freeze as the child's fork boundary. */
+	parentLeafId?: string;
 	/** Provider prompt-cache identity to seed on the new session header. */
 	providerPromptCacheKey?: string;
 	/** Skip flushing the current session and delete it instead of saving. */

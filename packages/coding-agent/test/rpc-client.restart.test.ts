@@ -1,7 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as path from "node:path";
 import { RpcClient } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-client";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { MAX_RPC_FRAME_BYTES } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-frame";
+import { type ChildProcess, ptree, TempDir } from "@oh-my-pi/pi-utils";
 
 const MOCK_AGENT = path.join(import.meta.dir, "fixtures", "mock-rpc-agent.ts");
 
@@ -28,6 +29,45 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 			{ role: "user", content: "first", timestamp: 1 },
 			{ role: "assistant", content: [{ type: "text", text: "second" }], timestamp: 2 },
 		]);
+	}, 20_000);
+
+	test("chunks oversized commands after protocol v2 negotiation", async () => {
+		using tempDir = TempDir.createSync("@omp-rpc-v2-command-");
+		const commandCaptureFile = tempDir.join("commands.jsonl");
+		const physicalCaptureFile = tempDir.join("physical.jsonl");
+		const message = "x".repeat(MAX_RPC_FRAME_BYTES + 1024);
+		using client = new RpcClient({
+			cliPath: MOCK_AGENT,
+			env: {
+				MOCK_RPC_V2: "1",
+				MOCK_RPC_CAPTURE_FILE: commandCaptureFile,
+				MOCK_RPC_PHYSICAL_CAPTURE_FILE: physicalCaptureFile,
+			},
+		});
+
+		await client.start();
+		await client.prompt(message);
+		await client.abort();
+
+		const physicalLines = (await Bun.file(physicalCaptureFile).text()).trim().split("\n");
+		for (const line of physicalLines) {
+			expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(MAX_RPC_FRAME_BYTES);
+		}
+		const physicalFrames = physicalLines.map(line => JSON.parse(line) as Record<string, unknown>);
+		const chunks = physicalFrames.filter(frame => frame.type === "rpc_chunk");
+		expect(chunks.length).toBeGreaterThan(1);
+		expect(chunks.every(frame => frame.count === chunks.length)).toBe(true);
+		expect(physicalFrames.filter(frame => frame.type !== "rpc_chunk").map(frame => frame.type)).toEqual([
+			"negotiate_protocol",
+			"abort",
+		]);
+
+		const commands = (await Bun.file(commandCaptureFile).text())
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const prompt = commands.find(frame => frame.type === "prompt");
+		expect(prompt).toMatchObject({ type: "prompt", message });
 	}, 20_000);
 
 	test("normalizes omitted state fields and a runtime-invalid tokensPerSecond", async () => {
@@ -179,6 +219,56 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 		}
 	}, 10_000);
 
+	test("rejects pending requests and reaps a worker that closes stdout without exiting", async () => {
+		let stdoutController: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let resolveExit: ((exitCode: number) => void) | undefined;
+		let killCalls = 0;
+		const exited = new Promise<number>(resolve => {
+			resolveExit = resolve;
+		});
+		const stdout = new ReadableStream<Uint8Array>({
+			start(controller) {
+				stdoutController = controller;
+				controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: "ready" })}\n`));
+			},
+		});
+		const fakeChild = {
+			stdout,
+			stdin: {
+				write() {
+					stdoutController?.close();
+					stdoutController = undefined;
+					return 0;
+				},
+				flush() {
+					return 0;
+				},
+			},
+			exited,
+			peekStderr() {
+				return "";
+			},
+			kill() {
+				killCalls += 1;
+				resolveExit?.(0);
+			},
+		};
+		const spawn = spyOn(ptree, "spawn").mockImplementation(
+			() => fakeChild as unknown as ReturnType<typeof ptree.spawn>,
+		);
+
+		try {
+			using client = new RpcClient({ cliPath: MOCK_AGENT });
+			await client.start();
+
+			await expect(client.getState()).rejects.toThrow("Agent output stream ended unexpectedly");
+			await expect(client.getState()).rejects.toThrow("Client not started");
+			expect(killCalls).toBe(1);
+		} finally {
+			spawn.mockRestore();
+		}
+	}, 5_000);
+
 	test("reports exit code and stderr when a ready worker exits", async () => {
 		using client = new RpcClient({
 			cliPath: MOCK_AGENT,
@@ -193,4 +283,41 @@ describe("RpcClient lifecycle (issue #4079 B)", () => {
 			"Agent process exited with code 23. Stderr: fixture worker failed",
 		);
 	});
+
+	test("start() rejects instead of hanging when a pre-ready worker closes stdout and never exits", async () => {
+		// The worker outlives its own stdout, so start() cannot learn an exit code
+		// and must still fail: it waits a bounded time for the exit, then reports
+		// the stream end. A regression stalls until the 30s ready timeout, which
+		// this test's own timeout catches.
+		let resolveExit: ((exitCode: number) => void) | undefined;
+		let killCalls = 0;
+		const fakeChild = {
+			stdout: new ReadableStream<Uint8Array>({
+				start(controller) {
+					controller.close();
+				},
+			}),
+			stdin: { write: () => 0, flush: () => 0 },
+			exited: new Promise<number>(resolve => {
+				resolveExit = resolve;
+			}),
+			peekStderr: () => "worker went quiet",
+			kill() {
+				killCalls += 1;
+				resolveExit?.(0);
+			},
+		};
+		const spawn = spyOn(ptree, "spawn").mockImplementation(() => fakeChild as unknown as ChildProcess);
+
+		try {
+			using client = new RpcClient({ cliPath: MOCK_AGENT, terminationGraceMs: 10 });
+			await expect(client.start()).rejects.toThrow(
+				"Agent output stream ended before ready. Stderr: worker went quiet",
+			);
+			// The failed start must also reap the orphan rather than leak it.
+			expect(killCalls).toBe(1);
+		} finally {
+			spawn.mockRestore();
+		}
+	}, 5_000);
 });
