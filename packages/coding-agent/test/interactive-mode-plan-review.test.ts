@@ -226,6 +226,72 @@ describe("InteractiveMode plan review rendering", () => {
 		expect(review.mock.calls[1]?.[0]).not.toContain("First plan");
 	});
 
+	it.each([
+		["approval", "Approve and keep context", undefined],
+		["refinement", "Refine plan", "Add a rollback step."],
+		["cancellation", undefined, undefined],
+	] as const)("does not leave a durable review record after TUI %s", async (outcome, choice, feedback) => {
+		await mode.handlePlanModeCommand();
+		const planFilePath = mode.planModePlanFilePath ?? "local://PLAN.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nDo the thing.\n");
+
+		const propose = session.peekPlanProposalHandler();
+		if (!propose) throw new Error("Expected plan proposal handler");
+		const proposal = await propose("Plan");
+		const details = proposal.details;
+		if (
+			typeof details !== "object" ||
+			details === null ||
+			!("planFilePath" in details) ||
+			typeof details.planFilePath !== "string" ||
+			!("title" in details) ||
+			typeof details.title !== "string" ||
+			!("planExists" in details) ||
+			typeof details.planExists !== "boolean"
+		) {
+			throw new Error("Expected plan approval details");
+		}
+
+		vi.spyOn(session, "abort").mockResolvedValue();
+		vi.spyOn(session, "getContextUsage").mockReturnValue(undefined);
+		const review = vi
+			.spyOn(mode, "showPlanReview")
+			.mockImplementation(async (_plan, _title, _options, dialogOptions) => {
+				if (feedback) dialogOptions?.onFeedbackChange?.(feedback);
+				return choice;
+			});
+		const clear = vi.spyOn(mode, "handleClearCommand").mockResolvedValue();
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.handlePlanApproval({
+			planFilePath: details.planFilePath,
+			title: details.title,
+			planExists: details.planExists,
+		});
+
+		const durableReviews = session.sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === "plan_review");
+		expect(durableReviews).toEqual([]);
+		expect(review).toHaveBeenCalledTimes(1);
+		if (outcome === "approval") {
+			expect(clear).not.toHaveBeenCalled();
+			expect(prompt).toHaveBeenCalledTimes(1);
+			expect(prompt.mock.calls[0]?.[1]).toMatchObject({ synthetic: true });
+		} else if (outcome === "refinement") {
+			expect(clear).not.toHaveBeenCalled();
+			expect(prompt).toHaveBeenCalledTimes(1);
+			expect(prompt.mock.calls[0]?.[0]).toBe("Add a rollback step.");
+		} else {
+			expect(clear).not.toHaveBeenCalled();
+			expect(prompt).not.toHaveBeenCalled();
+		}
+	});
+
 	it("restores dismissed annotations only when reopening the same plan", async () => {
 		const firstPlanFilePath = "local://first-plan.md";
 		const secondPlanFilePath = "local://second-plan.md";

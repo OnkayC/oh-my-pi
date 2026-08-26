@@ -3,6 +3,7 @@ name: CI
 on:
    push:
       branches: [main]
+      tags: ["v*"]
       paths:
          - "packages/**"
          - "crates/**"
@@ -63,17 +64,12 @@ on:
             type: boolean
             default: false
 
-# Release runs publish a `v*` tag pushed atomically with main HEAD; sharing
-# the cheap branch-wide `CI-refs/heads/main` group meant a later main push
-# silently cancelled the in-flight release and left the tag without a GitHub
-# Release or npm publish (#2564). Detect release runs at workflow-scheduling
-# time via the release-script commit subject (`chore: bump version to vX.Y.Z`),
-# via `v*` tag-ref dispatches, and via manual dispatches whose tag-on-HEAD
-# status is only known after checkout; scope them to a per-sha group with no
-# cancellation. Every other event keeps branch-wide cancellation for PR/main churn.
+# Tag pushes are authoritative release runs. Keep them in a per-SHA group so
+# ordinary main/PR churn cannot cancel publication; non-release runs retain
+# branch-wide cancellation.
 concurrency:
-   group: "${{ github.workflow }}-${{ (startsWith(github.event.head_commit.message, 'chore: bump version to ') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && format('release-{0}', github.sha) || github.ref }}"
-   cancel-in-progress: "${{ !(startsWith(github.event.head_commit.message, 'chore: bump version to ') || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') }}"
+   group: "${{ github.workflow }}-${{ startsWith(github.ref, 'refs/tags/v') && format('release-{0}', github.sha) || github.ref }}"
+   cancel-in-progress: "${{ !startsWith(github.ref, 'refs/tags/v') }}"
 
 env:
    FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -82,22 +78,13 @@ permissions:
    contents: read
 
 jobs:
-   # scripts/release.ts pushes the version-bump commit and its `v*` tag
-   # atomically (`git push --atomic origin refs/heads/main:refs/heads/main
-   # <sha>:refs/tags/v<version>`), so a release now arrives as a single `push` to
-   # `refs/heads/main` — we no longer trigger on the tag ref at all (see
-   # `on.push`). This one branch-push run is therefore authoritative: it runs the
-   # full build AND, when HEAD carries a release tag, the release/publish jobs.
-   # `release_metadata` resolves that tag once so downstream jobs switch on
-   # `is-release` and address the tag by name — `github.ref` is
-   # `refs/heads/main` here, not the tag. A `workflow_dispatch` from a `v*` tag
-   # ref (or from a tagged main HEAD) is also treated as a release.
+   # Release/publish jobs run only for a pushed `v*` tag. Main pushes still run
+   # validation, but carrying a tag at HEAD no longer turns the branch run into
+   # a second release.
    release_metadata:
       name: Resolve release metadata
-      # Hosted, not omp-kata: this ~20 s git-tag probe gates the whole release
-      # chain, and queueing it behind the 4-runner kata pool adds dead minutes
-      # to the darwin critical path.
-      runs-on: ubuntu-22.04
+      # This lightweight gate always runs on a standard GitHub-hosted runner.
+      runs-on: ubuntu-24.04
       outputs:
          is-release: ${{ steps.detect.outputs.is-release }}
          release-tag: ${{ steps.detect.outputs.release-tag }}
@@ -105,35 +92,20 @@ jobs:
          # the GitHub release prerelease, and skip the stable-only brew tap.
          channel: ${{ steps.detect.outputs.channel }}
       steps:
-         # Only a main-branch run needs tags fetched, so `git tag --points-at
-         # HEAD` can see the freshly-pushed `v*`. A tag-ref dispatch reads the
-         # tag straight from `github.ref_name`, and fetching `--tags` while
-         # checkout uses an explicit tag refspec makes git refuse — so scope
-         # fetch-tags to main refs.
-         - uses: actions/checkout@v4
-           with:
-              fetch-tags: ${{ github.ref == 'refs/heads/main' }}
-         - name: Detect release tag at HEAD
+         - name: Detect release tag
            id: detect
            shell: bash
            run: |
               is_release=false
               release_tag=""
               channel=stable
-              case "${{ github.ref }}" in
+              case "$GITHUB_REF" in
                 refs/tags/v[0-9]*)
-                  release_tag="${{ github.ref_name }}"
-                  ;;
-                refs/heads/main)
-                  if [ "${{ github.event_name }}" != "pull_request" ]; then
-                    release_tag=$(git tag --points-at HEAD | grep -E '^v[0-9]' | head -n1 || true)
-                  fi
+                  release_tag="$GITHUB_REF_NAME"
+                  is_release=true
+                  echo "Tag $release_tag triggers a release."
                   ;;
               esac
-              if [ -n "$release_tag" ]; then
-                echo "HEAD carries release tag $release_tag; this run builds and publishes the release."
-                is_release=true
-              fi
               if [[ "$release_tag" == *-canary.* ]]; then
                 channel=canary
               fi
@@ -143,9 +115,13 @@ jobs:
                 echo "channel=$channel"
               } >> "$GITHUB_OUTPUT"
 
+   # Fork: tag/release runs skip lint, rust, and the TS test fan-out. Those
+   # already ran on the main push that produced the tag. Release jobs only
+   # build linux-x64, linux-arm64, and darwin-arm64 — no musl or Windows.
    check:
       name: Lint, type check & web build
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+      runs-on: ubuntu-24.04
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -165,15 +141,13 @@ jobs:
          - name: Build collab web
            run: bun run collab:web:build
 
-   # Rust validation (tests, clippy, rustfmt) runs on non-PR events only.
-   # Native-changing PRs are rare enough that they do not warrant PR-side
-   # Rust validation or a PR-side addon build (see native_addons): Rust is
-   # validated post-merge on main (kata remote cache, warm) and again at
-   # release. A skipped required check still satisfies branch protection.
+   # Rust validation (tests, clippy, rustfmt) runs on non-PR, non-tag events.
+   # Native-changing PRs are rare enough that Rust remains a post-merge check;
+   # pull requests exercise TypeScript against the latest released addons.
    rust_validate:
       name: Validate Rust workspace (bazel)
-      if: github.event_name != 'pull_request'
-      runs-on: omp-kata
+      if: ${{ github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/v') }}
+      runs-on: ubuntu-24.04
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -215,11 +189,11 @@ jobs:
    # skips its version sentinel for workspace loads, so release addons load
    # fine under a newer checkout; a PR whose TS tests depend on changed
    # native behavior fails visibly and the native side lands via main.
-   # Main (kata, cluster remote cache) builds all Linux-hosted targets with
-   # bazel. Job name says "bazel" for continuity with required checks.
+   # Main builds all Linux-hosted targets with Bazel. Job name says "bazel"
+   # for continuity with required checks.
    native_addons:
       name: Build native addons (bazel)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       steps:
          - uses: actions/checkout@v4
 
@@ -273,7 +247,7 @@ jobs:
                 echo "::notice title=Native sources changed::PR CI tests against the latest release addons by design; native changes are validated post-merge on main and at release."
               fi
 
-         # ---- main path: bazel build of all Linux-hosted targets ----
+         # ---- main path: hosted Bazel build of all Linux targets ----
          - id: cache
            if: github.event_name != 'pull_request'
            uses: ./.github/actions/bazel-cache
@@ -284,26 +258,18 @@ jobs:
            run: |
               set -eo pipefail
               if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
-              # The addon cdylib links each peak at several GiB of rustc RSS;
-              # the aggregate //:natives-linux-all build runs all six
-              # concurrently, which OOMs the kata pod and takes the bazel
-              # server with it (exit 37 "Server terminated abruptly", runs
-              # 30556752623 / 30557524371). Build one addon per invocation —
-              # analysis and cached actions are shared through the persistent
-              # server, so only the heavy links serialize — then assemble the
-              # aggregate as a no-op (also catches targets added to the
-              # filegroup but missing from this list).
+              # The addon cdylib links each peak at several GiB of rustc RSS,
+              # so build one target per invocation. Fork ships linux-x64 and
+              # linux-arm64 only — skip musl/Windows, and skip linux-arm64
+              # except on tag releases (tests only load the x64 pair).
               : > "$RUNNER_TEMP/bazel-build.log"
-              for target in \
-                natives-linux-arm64 \
-                natives-linux-musl-arm64 \
-                natives-linux-musl-x64-baseline \
-                natives-linux-x64-baseline \
-                natives-linux-x64-modern \
-                natives-win32-x64-baseline; do
+              targets="natives-linux-x64-baseline natives-linux-x64-modern"
+              if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+                targets="natives-linux-arm64 $targets"
+              fi
+              for target in $targets; do
                 bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build "//:$target" 2>&1 | tee -a "$RUNNER_TEMP/bazel-build.log"
               done
-              bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build //:natives-linux-all 2>&1 | tee -a "$RUNNER_TEMP/bazel-build.log"
          # Cache-hit visibility: a supposedly warm build that executes
          # thousands of actions is the failure mode that made CI slow — make
          # it visible in the run summary instead of discovering it weeks in.
@@ -327,9 +293,9 @@ jobs:
 
    test_workspace:
       name: Test TS workspace fast
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 20
       steps:
          - uses: actions/checkout@v4
@@ -350,9 +316,9 @@ jobs:
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 20
       steps:
          - uses: actions/checkout@v4
@@ -368,9 +334,9 @@ jobs:
 
    test_ts_native:
       name: Test TS native/integration packages
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -386,9 +352,9 @@ jobs:
 
    test_coding_agent_ui:
       name: Test coding-agent UI/TUI (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -404,9 +370,9 @@ jobs:
 
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -424,9 +390,9 @@ jobs:
 
    test_coding_agent_native:
       name: Test coding-agent native/unit (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
@@ -442,9 +408,9 @@ jobs:
 
    test_smoke:
       name: Test CLI smoke (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       timeout-minutes: 15
       steps:
          - uses: actions/checkout@v4
@@ -458,9 +424,9 @@ jobs:
 
    install_methods:
       name: Install method smoke tests
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ubuntu-24.04
       needs: [native_addons]
-      if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
+      if: ${{ !cancelled() && needs.native_addons.result == 'success' && !startsWith(github.ref, 'refs/tags/v') }}
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/setup-system-deps
@@ -473,24 +439,14 @@ jobs:
               OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
            run: bun run ci:test:install-methods
 
-   # Aggregates every validation job so publish-side release jobs gate on one
-   # result. Binary BUILDS deliberately do not wait for this gate — they run
-   # in parallel with the test fan-out and only publishing is held back.
+   # Fork releases do not re-run the test fan-out. Publishing waits only for
+   # the native addons the remaining binaries need.
    release_gate:
       name: Release validation gate
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
-         needs.rust_validate.result == 'success' &&
-         needs.native_addons.result == 'success' &&
-         needs.test_workspace.result == 'success' &&
-         needs.test_coding_agent_singleton.result == 'success' &&
-         needs.test_ts_native.result == 'success' &&
-         needs.test_coding_agent_ui.result == 'success' &&
-         needs.test_coding_agent_runtime.result == 'success' &&
-         needs.test_coding_agent_native.result == 'success' &&
-         needs.test_smoke.result == 'success' && needs.check.result == 'success' &&
-         needs.install_methods.result == 'success' }}
-      needs: [release_metadata, check, rust_validate, native_addons, test_workspace, test_coding_agent_singleton, test_ts_native, test_coding_agent_ui, test_coding_agent_runtime, test_coding_agent_native, test_smoke, install_methods]
-      runs-on: ubuntu-22.04
+         needs.native_addons.result == 'success' }}
+      needs: [release_metadata, native_addons]
+      runs-on: ubuntu-24.04
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -501,11 +457,9 @@ jobs:
            run: bun scripts/gen-clippy-bazelrc.ts --check
          - run: echo "release validation green"
 
-   # Builds (does not publish) the Linux-hosted release binaries in parallel
-   # with the test fan-out; the single need is native_addons, whose artifact
-   # supplies their addons. Darwin builds live in release_binary_darwin so
-   # they start at release_metadata time instead. Publishing (npm leaves,
-   # GitHub release, core npm) is gated on release_gate downstream.
+   # Builds (does not publish) the Linux-hosted release binaries. Darwin
+   # builds live in release_binary_darwin so they start at release_metadata
+   # time instead. Publishing is gated on release_gate downstream.
    release_binary:
       name: "Release binary: ${{ matrix.target_id }}"
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
@@ -516,21 +470,12 @@ jobs:
          matrix:
             include:
                - {
-                    os: ubuntu-22.04,
+                    os: ubuntu-24.04,
                     platform: linux,
                     arch: x64,
                     target_id: linux-x64,
                     binary_path: packages/coding-agent/binaries/omp-linux-x64,
                     native_targets: linux-x64-baseline linux-x64-modern,
-                 }
-               - {
-                    os: ubuntu-22.04,
-                    platform: linux,
-                    libc: musl,
-                    arch: x64,
-                    target_id: linux-musl-x64,
-                    binary_path: packages/coding-agent/binaries/omp-linux-musl-x64,
-                    native_targets: linux-musl-x64-baseline,
                  }
                - {
                     os: ubuntu-24.04-arm,
@@ -539,23 +484,6 @@ jobs:
                     target_id: linux-arm64,
                     binary_path: packages/coding-agent/binaries/omp-linux-arm64,
                     native_targets: linux-arm64,
-                 }
-               - {
-                    os: ubuntu-24.04-arm,
-                    platform: linux,
-                    libc: musl,
-                    arch: arm64,
-                    target_id: linux-musl-arm64,
-                    binary_path: packages/coding-agent/binaries/omp-linux-musl-arm64,
-                    native_targets: linux-musl-arm64,
-                 }
-               - {
-                    os: ubuntu-22.04,
-                    platform: win32,
-                    arch: x64,
-                    target_id: win32-x64,
-                    binary_path: packages/coding-agent/binaries/omp-windows-x64.exe,
-                    native_targets: win32-x64-baseline,
                  }
       runs-on: ${{ matrix.os }}
       permissions:
@@ -579,29 +507,11 @@ jobs:
            env:
               RELEASE_TARGETS: ${{ matrix.target_id }}
            run: bun run ci:release:build-binaries
-         # Windows binary is cross-built on Linux, so we have no Windows runner
-         # to smoke it on. Cross-build correctness is verified via the bun
-         # `--compile --target=bun-windows-x64-*` cross-compile. Musl binaries
-         # need the musl loader, which glibc runners lack — they are smoked in
-         # the Alpine container step below instead.
          - name: Smoke release binary
-           if: matrix.platform != 'win32' && matrix.libc != 'musl'
            run: |
               runtime_dir="$(mktemp -d)"
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --version
               HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" "${{ matrix.binary_path }}" --smoke-test
-         - name: Smoke musl release binary on Alpine
-           if: matrix.libc == 'musl'
-           run: |
-              binary="$(realpath "${{ matrix.binary_path }}")"
-              # Bun's musl-target binaries link libstdc++/libgcc dynamically;
-              # Alpine users install them alongside the binary (same as bun itself).
-              docker run --rm -v "$binary:/usr/local/bin/omp:ro" alpine:3.22 sh -ec '
-                apk add --no-cache libstdc++ libgcc >/dev/null
-                runtime_dir="$(mktemp -d)"
-                HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" omp --version
-                HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" omp --smoke-test
-              '
          - name: Upload release binary artifact
            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
            with:
@@ -620,12 +530,6 @@ jobs:
          fail-fast: false
          matrix:
             include:
-               - {
-                    os: macos-15-intel,
-                    target_id: darwin-x64,
-                    binary_path: packages/coding-agent/binaries/omp-darwin-x64,
-                    native_targets: darwin-x64-baseline,
-                 }
                - {
                     os: macos-14,
                     target_id: darwin-arm64,
@@ -701,12 +605,13 @@ jobs:
    release_native_leaves:
       name: Publish native leaf packages
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
+         github.repository == 'can1357/oh-my-pi' &&
          needs.release_gate.result == 'success' &&
          needs.release_binary.result == 'success' &&
          needs.release_binary_darwin.result == 'success' &&
          !inputs.skip_npm }}
       needs: [release_metadata, release_gate, release_binary, release_binary_darwin]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       # id-token lets npm mint the OIDC token for trusted publishing; the
       # NODE_AUTH_TOKEN below is the fallback for unconfigured packages.
       permissions:
@@ -764,7 +669,7 @@ jobs:
          needs.release_binary.result == 'success' &&
          needs.release_binary_darwin.result == 'success' }}
       needs: [release_metadata, release_gate, release_binary, release_binary_darwin]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       permissions:
          contents: write
       steps:
@@ -852,6 +757,7 @@ jobs:
    release_npm:
       name: Publish to npm
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
+         github.repository == 'can1357/oh-my-pi' &&
          needs.release_binary.result == 'success' &&
          needs.release_binary_darwin.result == 'success' &&
          needs.release_github_verify.result == 'success' &&
@@ -861,7 +767,7 @@ jobs:
       # leaf packages as lockstep-versioned optionalDependencies, so installs
       # resolve them the moment the core version is live.
       needs: [release_metadata, release_binary, release_binary_darwin, release_github_verify, release_native_leaves]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       # `id-token: write` lets npm mint the GitHub OIDC token it exchanges for a
       # short-lived publish token (trusted publishing + provenance). When a
       # package has no matching trusted publisher configured, npm silently falls
@@ -913,7 +819,7 @@ jobs:
          needs.release_metadata.outputs.channel != 'canary' &&
          needs.release_github_verify.result == 'success' }}
       needs: [release_metadata, release_github_verify]
-      runs-on: ubuntu-22.04
+      runs-on: ubuntu-24.04
       env:
          HAS_TAP_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY != '' }}
       steps:

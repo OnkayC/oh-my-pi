@@ -224,8 +224,9 @@ export class SessionProviderBoundary {
 	async buildImageDescriptionNotice(
 		normalizedImages: ImageContent[],
 		signal?: AbortSignal,
+		modelOverride?: Model,
 	): Promise<CustomMessage | undefined> {
-		const model = this.#host.model();
+		const model = modelOverride ?? this.#host.model();
 		const shouldDescribe =
 			!!model &&
 			!model.input.includes("image") &&

@@ -9,29 +9,47 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Generic, Mapping, Sequence, TypeVar, cast
+from typing import (
+    Any,
+    Generic,
+    Literal,
+    TypeVar,
+    cast,
+    overload,
+)
 
 from .host_tools import HostTool, HostToolContext
 from .host_uris import HostUri, HostUriContext, normalize_read_result
 from .protocol import (
-    AgentStartEvent,
     AgentEndEvent,
     AgentMessage,
+    AgentStartEvent,
+    ApprovalDecision,
+    ApprovalMode,
+    ApprovalRequest,
+    ApprovalResolved,
+    AskDialogResult,
+    AskResolved,
     AssistantMessage,
+    AuthStatus,
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     AutoRetryEndEvent,
     AutoRetryStartEvent,
+    AvailableSkill,
     BashResult,
-    FastModeResult,
     BranchMessage,
     BranchResult,
     CancellationResult,
     CompactionResult,
     ExtensionError,
     ExtensionUiRequest,
+    FastModeResult,
+    HostTurnBoundary,
+    HostTurnRollbackResult,
     ImageContent,
     InterruptMode,
     JsonObject,
@@ -47,17 +65,19 @@ from .protocol import (
     RetryFallbackSucceededEvent,
     RpcAgentEvent,
     RpcNotification,
+    RuntimePolicy,
+    SemanticCapabilities,
     SessionState,
     SessionStats,
     SteeringMode,
     StreamingBehavior,
     ThinkingLevel,
     ThinkingLevelCycleResult,
+    TodoAutoClearEvent,
     TodoItem,
     TodoPhase,
-    TodoStatus,
-    TodoAutoClearEvent,
     TodoReminderEvent,
+    TodoStatus,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
     ToolExecutionUpdateEvent,
@@ -67,15 +87,21 @@ from .protocol import (
     UnknownNotification,
     assistant_text,
     parse_agent_messages,
+    parse_auth_status,
+    parse_available_skills,
     parse_bash_result,
-    parse_fast_mode_result,
     parse_branch_messages,
     parse_branch_result,
     parse_cancellation_result,
     parse_compaction_result,
+    parse_fast_mode_result,
+    parse_host_turn_rollback_result,
+    parse_host_turns,
     parse_model_cycle_result,
     parse_model_info,
     parse_notification,
+    parse_runtime_policy,
+    parse_semantic_capabilities,
     parse_session_state,
     parse_session_stats,
     parse_thinking_level_cycle_result,
@@ -85,6 +111,9 @@ from .protocol import (
 AgentEventListener = Callable[[RpcAgentEvent], None]
 NotificationListener = Callable[[RpcNotification], None]
 UiRequestListener = Callable[[ExtensionUiRequest], None]
+ApprovalRequestListener = Callable[[ApprovalRequest], None]
+ApprovalResolvedListener = Callable[[ApprovalResolved], None]
+AskResolvedListener = Callable[[AskResolved], None]
 ExtensionErrorListener = Callable[[ExtensionError], None]
 ReadyListener = Callable[[ReadyEvent], None]
 UnknownNotificationListener = Callable[[UnknownNotification], None]
@@ -122,6 +151,29 @@ _RPC_CHUNK_PAYLOAD_BYTES = 256 * 1024
 _RPC_MESSAGES_PAGE_BUSY_ERROR = "Cannot page messages while the session is changing"
 _RPC_MESSAGES_PAGE_STALE_ERROR = "RPC message cursor is stale"
 _RPC_MESSAGES_PAGE_FALLBACK_CODES = frozenset({"session_busy", "stale_cursor"})
+_PYTHON_CLIENT_CAPABILITY_REVISIONS = {
+    "structuredApprovals": 1,
+    "runtimePolicy": 1,
+    "authStatus": 1,
+    "richUserInput": 1,
+    "hostTurns": 1,
+    "modelCatalog": 1,
+    "skills": 1,
+    "tasks": 1,
+}
+
+
+def _cap_supported_capabilities(
+    capabilities: SemanticCapabilities,
+) -> SemanticCapabilities:
+    return parse_semantic_capabilities(
+        {
+            name: min(revision, supported_revision)
+            for name, revision in capabilities.to_wire().items()
+            if (supported_revision := _PYTHON_CLIENT_CAPABILITY_REVISIONS.get(name))
+            is not None
+        }
+    )
 
 
 @dataclass(slots=True)
@@ -304,6 +356,9 @@ class RpcError(RuntimeError):
     """Base exception for the Python RPC client."""
 
 
+class RpcFrameTooLargeError(RpcError):
+    """Raised when an outbound logical frame exceeds the negotiated transport limit."""
+
 class RpcTimeoutError(RpcError):
     """Raised when the server does not respond before a timeout."""
 
@@ -468,6 +523,7 @@ class RpcClient:
         request_timeout: float = 30.0,
         max_event_history: int | None = 10_000,
         max_stderr_chunks: int | None = 512,
+        capabilities: Mapping[str, int] | SemanticCapabilities | bool | None = None,
     ) -> None:
         self._command = tuple(command) if command is not None else None
         self._executable = executable
@@ -491,6 +547,19 @@ class RpcClient:
         self._no_title = no_title
         self._rpc_defaults = rpc_defaults
         self._extra_args = tuple(extra_args)
+        if capabilities is True or (
+            capabilities is not None
+            and capabilities is not False
+            and not isinstance(capabilities, (Mapping, SemanticCapabilities))
+        ):
+            raise ValueError(
+                "capabilities must be a mapping, SemanticCapabilities, False, or None"
+            )
+        self._requested_capabilities: SemanticCapabilities | Literal[False] | None = (
+            parse_semantic_capabilities(dict(capabilities))
+            if isinstance(capabilities, Mapping)
+            else cast(SemanticCapabilities | Literal[False] | None, capabilities)
+        )
         self._startup_timeout = startup_timeout
         self._request_timeout = request_timeout
         self._max_event_history = self._validate_history_limit(
@@ -521,6 +590,9 @@ class RpcClient:
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
         self._ui_requests: queue.Queue[ExtensionUiRequest] = queue.Queue()
+        self._pending_ui_requests: dict[str, ExtensionUiRequest] = {}
+        self._pending_ui_timers: dict[str, threading.Timer] = {}
+        self._scheduled_follow_up_ids: set[str] = set()
         self._stderr_chunks = _BoundedHistory[str](self._max_stderr_chunks)
         self._closed_error: BaseException | None = None
         self._stopping = False
@@ -528,6 +600,9 @@ class RpcClient:
         self._ready_event: ReadyEvent | None = None
         self._protocol_version = 1
         self._protocol_v2_enabled = False
+        self._write_chunk_counter = 0
+        self._offered_capabilities = SemanticCapabilities()
+        self._selected_capabilities = SemanticCapabilities()
         self._frame_decoder = _RpcFrameDecoder()
         self._protocol_errors = _BoundedHistory[RpcProtocolError](
             _DEFAULT_ERROR_HISTORY_LIMIT
@@ -536,6 +611,8 @@ class RpcClient:
             _DEFAULT_ERROR_HISTORY_LIMIT
         )
         self._prompt_lifecycle = _PromptLifecycleCoordinator()
+        self._host_turn_recovery_sync_lock = threading.Lock()
+        self._host_turn_recovery_synchronized = True
 
         self._notification_listeners: list[NotificationListener] = []
         self._event_listeners: list[AgentEventListener] = []
@@ -543,6 +620,10 @@ class RpcClient:
         self._ready_listeners: list[ReadyListener] = []
         self._unknown_notification_listeners: list[UnknownNotificationListener] = []
         self._ui_request_listeners: list[UiRequestListener] = []
+        self._approval_request_listeners: list[ApprovalRequestListener] = []
+        self._pending_approval_requests: dict[str, ApprovalRequest] = {}
+        self._approval_resolved_listeners: list[ApprovalResolvedListener] = []
+        self._ask_resolved_listeners: list[AskResolvedListener] = []
         self._extension_error_listeners: list[ExtensionErrorListener] = []
         self._protocol_error_listeners: list[ProtocolErrorListener] = []
         self._listener_error_listeners: list[ListenerErrorListener] = []
@@ -572,6 +653,14 @@ class RpcClient:
         with self._state_lock:
             return self._listener_errors.snapshot()
 
+    @property
+    def offered_capabilities(self) -> SemanticCapabilities:
+        return self._offered_capabilities
+
+    @property
+    def selected_capabilities(self) -> SemanticCapabilities:
+        return self._selected_capabilities
+
     def start(self) -> RpcClient:
         if self._process is not None:
             raise RpcError("RPC client is already started")
@@ -583,6 +672,9 @@ class RpcClient:
         self._ready_event = None
         self._protocol_version = 1
         self._protocol_v2_enabled = False
+        self._write_chunk_counter = 0
+        self._offered_capabilities = SemanticCapabilities()
+        self._selected_capabilities = SemanticCapabilities()
         self._frame_decoder = _RpcFrameDecoder()
         self._events.clear()
         self._async_errors.clear()
@@ -590,11 +682,18 @@ class RpcClient:
         self._completed_agent_runs = 0
         self._last_schedule_async_error_index = 0
         self._ui_requests = queue.Queue()
+        for timer in self._pending_ui_timers.values():
+            timer.cancel()
+        self._pending_ui_timers.clear()
+        self._pending_ui_requests.clear()
+        self._scheduled_follow_up_ids.clear()
+        self._host_turn_recovery_synchronized = True
         with self._state_lock:
             self._stderr_chunks.clear()
         with self._state_lock:
             self._protocol_errors.clear()
             self._listener_errors.clear()
+            self._pending_approval_requests.clear()
 
         process = subprocess.Popen(
             list(self._build_command()),
@@ -662,11 +761,54 @@ class RpcClient:
             except BaseException:
                 self.stop()
                 raise
+        self._offered_capabilities = (
+            ready_event.capabilities
+            if ready_event is not None and ready_event.capabilities is not None
+            else SemanticCapabilities()
+        )
+        # A selected hostTurns capability may replay a prepared durable turn
+        # immediately. Install the configured host-owned tool and URI surfaces
+        # first so recovery cannot run against a transient, incomplete startup
+        # config.
+        try:
+            if self._custom_tools:
+                self.set_custom_tools(self._custom_tools)
+            if self._host_uris:
+                self.set_host_uris(self._host_uris)
+        except BaseException:
+            self.stop()
+            raise
+        if (
+            not self._offered_capabilities.is_empty()
+            and self._requested_capabilities is not False
+        ):
+            requested_capabilities = cast(
+                SemanticCapabilities | None, self._requested_capabilities
+            )
+            requested_capabilities = _cap_supported_capabilities(
+                requested_capabilities
+                if requested_capabilities is not None
+                else self._offered_capabilities
+            )
+            try:
+                negotiation = self._request(
+                    "negotiate_capabilities",
+                    capabilities=requested_capabilities.to_wire(),
+                )
+                # Prefer the value published by `_handle_response` (set before
+                # any post-negotiate notification can run). Re-assign here so
+                # callers still observe the parse result if the response path
+                # did not update it.
+                self._selected_capabilities = parse_semantic_capabilities(
+                    negotiation.get("capabilities")
+                )
+            except BaseException:
+                self.stop()
+                raise
+        self._host_turn_recovery_synchronized = (
+            self._selected_capabilities.host_turns is None
+        )
 
-        if self._custom_tools:
-            self.set_custom_tools(self._custom_tools)
-        if self._host_uris:
-            self.set_host_uris(self._host_uris)
         return self
 
     def stop(self) -> None:
@@ -711,6 +853,11 @@ class RpcClient:
             self._pending_host_tool_calls.clear()
             self._host_tool_dispatch_names.clear()
             self._pending_host_uri_requests.clear()
+            for timer in self._pending_ui_timers.values():
+                timer.cancel()
+            self._pending_ui_timers.clear()
+            self._pending_ui_requests.clear()
+            self._scheduled_follow_up_ids.clear()
             self._process = None
             self._pgid = None
             if self._stdout_thread is not None:
@@ -806,8 +953,44 @@ class RpcClient:
         return self._add_typed_event_listener("todo_auto_clear", listener)
 
     def on_ui_request(self, listener: UiRequestListener) -> Callable[[], None]:
-        self._ui_request_listeners.append(listener)
-        return lambda: self._remove_listener(self._ui_request_listeners, listener)
+        with self._state_lock:
+            self._ui_request_listeners.append(listener)
+            pending = tuple(self._pending_ui_requests.values())
+        for request in pending:
+            self._dispatch_listeners("ui_request", request.type, (listener,), request)
+
+        def remove() -> None:
+            with self._state_lock:
+                self._remove_listener(self._ui_request_listeners, listener)
+
+        return remove
+
+    def on_approval_request(
+        self, listener: ApprovalRequestListener
+    ) -> Callable[[], None]:
+        with self._state_lock:
+            self._approval_request_listeners.append(listener)
+            pending = tuple(self._pending_approval_requests.values())
+        for request in pending:
+            self._dispatch_listeners(
+                "approval_request", request.type, (listener,), request
+            )
+
+        def remove() -> None:
+            with self._state_lock:
+                self._remove_listener(self._approval_request_listeners, listener)
+
+        return remove
+
+    def on_approval_resolved(
+        self, listener: ApprovalResolvedListener
+    ) -> Callable[[], None]:
+        self._approval_resolved_listeners.append(listener)
+        return lambda: self._remove_listener(self._approval_resolved_listeners, listener)
+
+    def on_ask_resolved(self, listener: AskResolvedListener) -> Callable[[], None]:
+        self._ask_resolved_listeners.append(listener)
+        return lambda: self._remove_listener(self._ask_resolved_listeners, listener)
 
     def on_extension_error(
         self, listener: ExtensionErrorListener
@@ -840,14 +1023,15 @@ class RpcClient:
         input_value: str | None = None,
         editor_value: str | None = None,
     ) -> Callable[[], None]:
-        """Auto-handle RPC UI requests for non-interactive hosts.
+        """Auto-handle RPC UI and approval requests for non-interactive hosts.
 
         Passive UI methods such as notifications and status updates are ignored.
         Confirm dialogs default to `False`. Select, input, and editor requests
-        are cancelled unless an explicit value is provided.
+        are cancelled without explicit values; rich ask requests are cancelled.
+        Structured approvals are denied when allowed, otherwise cancelled.
         """
 
-        def handle(request: ExtensionUiRequest) -> None:
+        def handle_ui_request(request: ExtensionUiRequest) -> None:
             if on_request is not None:
                 try:
                     on_request(request)
@@ -883,8 +1067,54 @@ class RpcClient:
                     self.send_ui_value(request.id, editor_value)
                 else:
                     self.cancel_ui_request(request.id)
+                return
+            if request.method == "ask":
+                self.cancel_ui_request(request.id)
+                return
 
-        return self.on_ui_request(handle)
+        def handle_approval_request(request: ApprovalRequest) -> None:
+            for decision in ("deny", "cancel"):
+                if decision in request.allowed_decisions:
+                    self.respond_to_approval(
+                        request.id, cast(ApprovalDecision, decision)
+                    )
+                    return
+            # Listener exceptions are swallowed by _dispatch_listeners, so raising
+            # alone leaves the server approval hanging. Never fall through to
+            # approve_* when deny/cancel are absent — that would auto-approve.
+            # Prefer a protocol cancel: the server treats disallowed decisions as
+            # stale/cancel (not accepted). Do not call abort() here — this runs on
+            # the reader thread and a synchronous _request would deadlock waiting
+            # for its own response. If cancel cannot be sent, stop the process on
+            # a side thread so the tool cannot hang open.
+            try:
+                self.respond_to_approval(request.id, "cancel")
+            except BaseException as exc:
+                self._append_async_error(
+                    RpcError(
+                        f"Approval request {request.id!r} has no fail-closed "
+                        f"decision and cancel failed: {exc}"
+                    )
+                )
+                threading.Thread(
+                    target=self.stop,
+                    name="omp-rpc-fail-closed-stop",
+                    daemon=True,
+                ).start()
+
+        remove_ui_handler = self.on_ui_request(handle_ui_request)
+        remove_approval_handler = self.on_approval_request(handle_approval_request)
+        installed = True
+
+        def cleanup() -> None:
+            nonlocal installed
+            if not installed:
+                return
+            installed = False
+            remove_ui_handler()
+            remove_approval_handler()
+
+        return cleanup
 
     def next_ui_request(self, timeout: float | None = None) -> ExtensionUiRequest:
         try:
@@ -895,14 +1125,20 @@ class RpcClient:
             ) from exc
 
     def send_ui_value(self, request_id: str, value: str) -> None:
-        self._send_notification(
-            {"type": "extension_ui_response", "id": request_id, "value": value}
-        )
+        try:
+            self._send_notification(
+                {"type": "extension_ui_response", "id": request_id, "value": value}
+            )
+        except RpcFrameTooLargeError:
+            self.cancel_ui_request(request_id)
+            raise
+        self._forget_pending_ui_request(request_id)
 
     def send_ui_confirmation(self, request_id: str, confirmed: bool) -> None:
         self._send_notification(
             {"type": "extension_ui_response", "id": request_id, "confirmed": confirmed}
         )
+        self._forget_pending_ui_request(request_id)
 
     def cancel_ui_request(self, request_id: str, *, timed_out: bool = False) -> None:
         payload: JsonObject = {
@@ -913,10 +1149,80 @@ class RpcClient:
         if timed_out:
             payload["timedOut"] = True
         self._send_notification(payload)
+        self._forget_pending_ui_request(request_id)
+
+    def respond_to_approval(self, request_id: str, decision: ApprovalDecision) -> None:
+        if self._selected_capabilities.structured_approvals is None:
+            raise RpcError("RPC structuredApprovals capability was not selected")
+        self._send_notification(
+            {"type": "approval_response", "id": request_id, "decision": decision}
+        )
+        with self._state_lock:
+            self._pending_approval_requests.pop(request_id, None)
+
+    def respond_to_ask(self, request_id: str, result: AskDialogResult) -> None:
+        if self._selected_capabilities.rich_user_input is None:
+            raise RpcError("RPC richUserInput capability was not selected")
+        try:
+            self._send_notification(
+                {
+                    "type": "extension_ui_response",
+                    "id": request_id,
+                    "result": result.to_wire(),
+                }
+            )
+        except RpcFrameTooLargeError:
+            self.cancel_ui_request(request_id)
+            raise
+        self._forget_pending_ui_request(request_id)
 
     def get_state(self) -> SessionState:
         payload = self._request("get_state")
         return parse_session_state(payload)
+
+    def get_turns(self) -> tuple[HostTurnBoundary, ...]:
+        if self._selected_capabilities.host_turns is None:
+            raise RpcError("RPC hostTurns capability was not selected")
+        return parse_host_turns(self._request("get_turns"))
+
+    def rollback_turns(
+        self, count: int, expected_client_turn_ids: Sequence[str]
+    ) -> HostTurnRollbackResult:
+        if self._selected_capabilities.host_turns is None:
+            raise RpcError("RPC hostTurns capability was not selected")
+        return parse_host_turn_rollback_result(
+            self._request(
+                "rollback_turns",
+                count=count,
+                expectedClientTurnIds=list(expected_client_turn_ids),
+            )
+        )
+
+    def cancel_follow_up(self, client_turn_id: str) -> CancellationResult:
+        if self._selected_capabilities.host_turns is None:
+            raise RpcError("RPC hostTurns capability was not selected")
+        result = parse_cancellation_result(
+            self._request("cancel_follow_up", clientTurnId=client_turn_id)
+        )
+        if result.cancelled:
+            with self._event_condition:
+                if client_turn_id in self._scheduled_follow_up_ids:
+                    self._scheduled_follow_up_ids.remove(client_turn_id)
+                    self._completed_agent_runs += 1
+                    self._event_condition.notify_all()
+        return result
+
+    def set_runtime_policy(self, approval_mode: ApprovalMode) -> RuntimePolicy:
+        if self._selected_capabilities.runtime_policy is None:
+            raise RpcError("RPC runtimePolicy capability was not selected")
+        return parse_runtime_policy(
+            self._request("set_runtime_policy", approvalMode=approval_mode)
+        )
+
+    def get_auth_status(self) -> AuthStatus:
+        if self._selected_capabilities.auth_status is None:
+            raise RpcError("RPC authStatus capability was not selected")
+        return parse_auth_status(self._request("get_auth_status"))
 
     def set_fast_mode(self, enabled: bool) -> FastModeResult:
         return parse_fast_mode_result(self._request("set_fast_mode", enabled=enabled))
@@ -930,6 +1236,11 @@ class RpcClient:
 
     def cycle_model(self) -> ModelCycleResult | None:
         return parse_model_cycle_result(self._request("cycle_model"))
+
+    def get_available_skills(self) -> tuple[AvailableSkill, ...]:
+        if self._selected_capabilities.skills is None:
+            raise RpcError("RPC skills capability was not selected")
+        return parse_available_skills(self._request("get_available_skills"))
 
     def get_available_models(self) -> tuple[ModelInfo, ...]:
         payload = self._request("get_available_models")
@@ -1140,14 +1451,47 @@ class RpcClient:
         *,
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
+        client_turn_id: str | None = None,
     ) -> None:
-        self._request(
-            "prompt",
-            message=message,
-            images=list(images) if images is not None else None,
-            streamingBehavior=streaming_behavior,
+        self._submit_prompt(
+            message,
+            images=images,
+            streaming_behavior=streaming_behavior,
+            client_turn_id=client_turn_id,
         )
+
+    def _submit_prompt(
+        self,
+        message: str,
+        *,
+        images: Sequence[ImageContent] | None = None,
+        streaming_behavior: StreamingBehavior | None = None,
+        client_turn_id: str | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "message": message,
+            "images": list(images) if images is not None else None,
+            "streamingBehavior": streaming_behavior,
+        }
+        if client_turn_id is not None:
+            payload["clientTurnId"] = client_turn_id
+
+        self._synchronize_recovered_host_turns()
+        if client_turn_id is not None and self._host_turn_was_already_dispatched(
+            client_turn_id
+        ):
+            self._request("prompt", **payload)
+            return False
         self._mark_agent_run_scheduled()
+        try:
+            response = self._request("prompt", **payload)
+        except BaseException:
+            self._mark_agent_run_completed()
+            raise
+        if response.get("agentInvoked") is False:
+            self._mark_agent_run_completed()
+            return False
+        return True
 
     def steer(
         self, message: str, *, images: Sequence[ImageContent] | None = None
@@ -1158,14 +1502,72 @@ class RpcClient:
             images=list(images) if images is not None else None,
         )
 
+    @overload
     def follow_up(
-        self, message: str, *, images: Sequence[ImageContent] | None = None
+        self,
+        message: str,
+        *,
+        images: Sequence[ImageContent] | None = None,
+    ) -> None: ...
+
+    @overload
+    def follow_up(
+        self,
+        message: str,
+        *,
+        client_turn_id: str,
+        option_fingerprint: str,
+        images: Sequence[ImageContent] | None = None,
+        turn_options: Mapping[str, Any] | None = None,
+    ) -> None: ...
+
+    def follow_up(
+        self,
+        message: str,
+        *,
+        client_turn_id: str | None = None,
+        option_fingerprint: str | None = None,
+        images: Sequence[ImageContent] | None = None,
+        turn_options: Mapping[str, Any] | None = None,
     ) -> None:
-        self._request(
-            "follow_up",
-            message=message,
-            images=list(images) if images is not None else None,
+        has_host_turn_options = (
+            client_turn_id is not None
+            or option_fingerprint is not None
+            or turn_options is not None
         )
+        if has_host_turn_options and (
+            client_turn_id is None or option_fingerprint is None
+        ):
+            raise ValueError(
+                "client_turn_id and option_fingerprint are both required "
+                "for durable follow-up calls"
+            )
+
+        payload: dict[str, Any] = {"message": message}
+        if images is not None:
+            payload["images"] = list(images)
+        if client_turn_id is not None and option_fingerprint is not None:
+            payload["clientTurnId"] = client_turn_id
+            payload["optionFingerprint"] = option_fingerprint
+        if turn_options is not None:
+            payload["turnOptions"] = dict(turn_options)
+        if client_turn_id is None:
+            self._request("follow_up", **payload)
+            return
+        self._synchronize_recovered_host_turns()
+        if self._host_turn_was_already_dispatched(client_turn_id):
+            self._request("follow_up", **payload)
+            return
+        self._mark_agent_run_scheduled()
+        with self._event_condition:
+            self._scheduled_follow_up_ids.add(client_turn_id)
+        try:
+            self._request("follow_up", **payload)
+        except BaseException:
+            with self._event_condition:
+                self._scheduled_follow_up_ids.discard(client_turn_id)
+            self._mark_agent_run_completed()
+            raise
 
     def abort(self) -> None:
         self._request("abort")
@@ -1173,6 +1575,7 @@ class RpcClient:
     def abort_and_prompt(
         self, message: str, *, images: Sequence[ImageContent] | None = None
     ) -> None:
+        self._synchronize_recovered_host_turns()
         self._request(
             "abort_and_prompt",
             message=message,
@@ -1186,16 +1589,28 @@ class RpcClient:
         *,
         images: Sequence[ImageContent] | None = None,
         streaming_behavior: StreamingBehavior | None = None,
+        client_turn_id: str | None = None,
         timeout: float | None = None,
     ) -> PromptTurn:
         operation = "prompt_and_wait"
         self._prompt_lifecycle.acquire(operation)
         try:
+            self._synchronize_recovered_host_turns()
             start_index = self._current_event_index()
             start_async_error_index = self._current_async_error_index()
-            self.prompt(message, images=images, streaming_behavior=streaming_behavior)
+            agent_invoked = self._submit_prompt(
+                message,
+                images=images,
+                streaming_behavior=streaming_behavior,
+                client_turn_id=client_turn_id,
+            )
+            if not agent_invoked:
+                return self._build_prompt_turn(())
             events = self._wait_for_agent_end(
-                start_index, start_async_error_index, timeout=timeout
+                start_index,
+                start_async_error_index,
+                timeout=timeout,
+                allow_local_completion=True,
             )
             return self._build_prompt_turn(events)
         finally:
@@ -1205,6 +1620,7 @@ class RpcClient:
         operation = "wait_for_idle"
         self._prompt_lifecycle.acquire(operation)
         try:
+            self._synchronize_recovered_host_turns()
             if self._is_agent_idle():
                 self._check_async_errors()
                 return
@@ -1238,6 +1654,61 @@ class RpcClient:
     def _current_async_error_index(self) -> int:
         with self._event_condition:
             return self._async_errors.current_index()
+
+    def _synchronize_recovered_host_turns(self) -> None:
+        if self._host_turn_recovery_synchronized:
+            return
+        with self._host_turn_recovery_sync_lock:
+            if self._host_turn_recovery_synchronized:
+                return
+            # The daemon serializes this command behind post-negotiation durable
+            # recovery, so its response is a write barrier after recovered events.
+            self._request("get_state")
+            with self._event_condition:
+                self._scheduled_agent_runs = 0
+                self._completed_agent_runs = 0
+                self._last_schedule_async_error_index = self._async_errors.current_index()
+            self._host_turn_recovery_synchronized = True
+
+    def _host_turn_was_already_dispatched(self, client_turn_id: str) -> bool:
+        if self._selected_capabilities.host_turns is None:
+            return False
+        try:
+            turns = self.get_turns()
+        except RpcCommandError:
+            # Older/partial servers may advertise hostTurns without implementing
+            # journal inspection. Preserve the pre-inspection submission path.
+            return False
+        return any(
+            turn.client_turn_id == client_turn_id
+            and turn.status in ("dispatched", "settled")
+            for turn in turns
+        )
+
+    def _forget_pending_ui_request(self, request_id: str) -> None:
+        with self._state_lock:
+            self._pending_ui_requests.pop(request_id, None)
+            timer = self._pending_ui_timers.pop(request_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _remember_pending_ui_request(self, request: ExtensionUiRequest) -> None:
+        timer: threading.Timer | None = None
+        with self._state_lock:
+            self._pending_ui_requests[request.id] = request
+            previous = self._pending_ui_timers.pop(request.id, None)
+            if request.method != "ask" and request.timeout is not None:
+                timer = threading.Timer(
+                    max(0, request.timeout) / 1000,
+                    self._forget_pending_ui_request,
+                    args=(request.id,),
+                )
+                timer.daemon = True
+                self._pending_ui_timers[request.id] = timer
+        if previous is not None:
+            previous.cancel()
+        if timer is not None:
+            timer.start()
 
     def _mark_agent_run_scheduled(self) -> None:
         with self._event_condition:
@@ -1328,6 +1799,8 @@ class RpcClient:
         start_index: int,
         start_async_error_index: int,
         timeout: float | None = None,
+        *,
+        allow_local_completion: bool = False,
     ) -> tuple[RpcAgentEvent, ...]:
         deadline = time.monotonic() + (timeout if timeout is not None else 60.0)
         with self._event_condition:
@@ -1362,6 +1835,15 @@ class RpcClient:
                         for payload in event_payloads
                     )
                     return events
+
+                if (
+                    allow_local_completion
+                    and self._scheduled_agent_runs == self._completed_agent_runs
+                ):
+                    return tuple(
+                        cast(RpcAgentEvent, parse_notification(payload))
+                        for payload in event_payloads
+                    )
 
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1840,10 +2322,46 @@ class RpcClient:
     def _write_json(self, process: subprocess.Popen[str], payload: JsonObject) -> None:
         if process.stdin is None:
             raise RpcProcessExitError("RPC process stdin is unavailable")
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         with self._write_lock:
             try:
-                process.stdin.write(json.dumps(payload))
-                process.stdin.write("\n")
+                if (
+                    self._protocol_version != 2
+                    or len(encoded) + 1 <= _MAX_RPC_FRAME_BYTES
+                ):
+                    process.stdin.write(encoded.decode("utf-8"))
+                    process.stdin.write("\n")
+                else:
+                    if len(encoded) > _MAX_RPC_REASSEMBLED_BYTES:
+                        raise RpcFrameTooLargeError(
+                            "RPC frame exceeded the protocol v2 reassembly limit"
+                        )
+                    self._write_chunk_counter += 1
+                    chunk_id = f"rpc-{self._write_chunk_counter}"
+                    count = (
+                        len(encoded) + _RPC_CHUNK_PAYLOAD_BYTES - 1
+                    ) // _RPC_CHUNK_PAYLOAD_BYTES
+                    for index in range(count):
+                        start = index * _RPC_CHUNK_PAYLOAD_BYTES
+                        end = (index + 1) * _RPC_CHUNK_PAYLOAD_BYTES
+                        chunk = encoded[start:end]
+                        frame = json.dumps(
+                            {
+                                "type": "rpc_chunk",
+                                "chunkId": chunk_id,
+                                "index": index,
+                                "count": count,
+                                "byteLength": len(encoded),
+                                "data": base64.b64encode(chunk).decode("ascii"),
+                            },
+                            separators=(",", ":"),
+                        )
+                        if len(frame.encode("utf-8")) + 1 > _MAX_RPC_FRAME_BYTES:
+                            raise RpcFrameTooLargeError(
+                                "RPC chunk exceeded the physical frame limit"
+                            )
+                        process.stdin.write(frame)
+                        process.stdin.write("\n")
                 process.stdin.flush()
             except (BrokenPipeError, OSError) as exc:
                 raise RpcProcessExitError(
@@ -1898,6 +2416,11 @@ class RpcClient:
                     continue
 
                 payload_type = payload.get("type")
+                if payload_type == "prompt_result":
+                    if payload.get("agentInvoked") is False:
+                        self._mark_agent_run_completed()
+                    continue
+
                 if payload_type in ("tool_execution_update", "tool_execution_end"):
                     self._normalize_host_tool_event(payload)
                 try:
@@ -1935,13 +2458,51 @@ class RpcClient:
                         notification,
                     )
                     continue
+                if isinstance(notification, ApprovalRequest):
+                    with self._state_lock:
+                        self._pending_approval_requests[notification.id] = notification
+                        approval_listeners = tuple(
+                            self._approval_request_listeners
+                        )
+                    self._dispatch_listeners(
+                        "approval_request",
+                        notification.type,
+                        approval_listeners,
+                        notification,
+                    )
+                    continue
+                if isinstance(notification, ApprovalResolved):
+                    with self._state_lock:
+                        self._pending_approval_requests.pop(notification.id, None)
+                    self._dispatch_listeners(
+                        "approval_resolved",
+                        notification.type,
+                        self._approval_resolved_listeners,
+                        notification,
+                    )
+                    continue
+                if isinstance(notification, AskResolved):
+                    self._forget_pending_ui_request(notification.id)
+                    self._dispatch_listeners(
+                        "ask_resolved",
+                        notification.type,
+                        self._ask_resolved_listeners,
+                        notification,
+                    )
+                    continue
 
                 if isinstance(notification, ExtensionUiRequest):
                     self._ui_requests.put(notification)
+                    if notification.method == "cancel" and notification.target_id:
+                        self._forget_pending_ui_request(notification.target_id)
+                    elif notification.requires_response():
+                        self._remember_pending_ui_request(notification)
+                    with self._state_lock:
+                        ui_listeners = tuple(self._ui_request_listeners)
                     self._dispatch_listeners(
                         "ui_request",
                         notification.type,
-                        self._ui_request_listeners,
+                        ui_listeners,
                         notification,
                     )
                     continue
@@ -1965,11 +2526,13 @@ class RpcClient:
                     continue
 
                 event = cast(RpcAgentEvent, notification)
+                if event.type == "host_turn_promoted":
+                    with self._event_condition:
+                        self._scheduled_follow_up_ids.discard(
+                            cast(str, getattr(event, "client_turn_id", ""))
+                        )
                 self._append_event(payload)
-                if (
-                    isinstance(event, AgentEndEvent)
-                    and event.is_terminal is not False
-                ):
+                if isinstance(event, AgentEndEvent) and event.is_terminal is not False:
                     self._mark_agent_run_completed()
                 self._dispatch_listeners(
                     "event", event.type, self._event_listeners, event
@@ -2035,6 +2598,22 @@ class RpcClient:
             with self._state_lock:
                 pending = self._pending.pop(request_id, None)
             if pending is not None:
+                # Capability selection must be visible before the reader can
+                # dispatch post-negotiate recovery notifications (e.g.
+                # approval_request) that call respond_to_approval.
+                if (
+                    pending.command == "negotiate_capabilities"
+                    and bool(payload.get("success", False))
+                ):
+                    data = payload.get("data")
+                    if isinstance(data, Mapping):
+                        try:
+                            self._selected_capabilities = parse_semantic_capabilities(
+                                data.get("capabilities")
+                            )
+                        except (TypeError, ValueError):
+                            # Let `_request` / start() re-parse and raise.
+                            pass
                 pending.response_queue.put(payload)
                 return
 
