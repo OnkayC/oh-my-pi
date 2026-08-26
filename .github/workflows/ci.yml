@@ -88,6 +88,9 @@ jobs:
       outputs:
          is-release: ${{ steps.detect.outputs.is-release }}
          release-tag: ${{ steps.detect.outputs.release-tag }}
+         # Canary tags publish to npm's canary dist-tag (derived script-side), mark
+         # the GitHub release prerelease, and skip the stable-only brew tap.
+         channel: ${{ steps.detect.outputs.channel }}
       steps:
          - name: Detect release tag
            id: detect
@@ -95,6 +98,7 @@ jobs:
            run: |
               is_release=false
               release_tag=""
+              channel=stable
               case "$GITHUB_REF" in
                 refs/tags/v[0-9]*)
                   release_tag="$GITHUB_REF_NAME"
@@ -102,9 +106,13 @@ jobs:
                   echo "Tag $release_tag triggers a release."
                   ;;
               esac
+              if [[ "$release_tag" == *-canary.* ]]; then
+                channel=canary
+              fi
               {
                 echo "is-release=$is_release"
                 echo "release-tag=$release_tag"
+                echo "channel=$channel"
               } >> "$GITHUB_OUTPUT"
 
    # Fork: tag/release runs skip lint, rust, and the TS test fan-out. Those
@@ -702,6 +710,7 @@ jobs:
            uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
            with:
               tag_name: ${{ needs.release_metadata.outputs.release-tag }}
+              prerelease: ${{ needs.release_metadata.outputs.channel == 'canary' }}
               files: |
                  packages/coding-agent/binaries/omp-*
                  packages/browser-relay/dist/omp-browser-relay-extension.zip
@@ -807,6 +816,7 @@ jobs:
    release_brew:
       name: Update Homebrew tap
       if: ${{ needs.release_metadata.outputs.is-release == 'true' && !cancelled() &&
+         needs.release_metadata.outputs.channel != 'canary' &&
          needs.release_github_verify.result == 'success' }}
       needs: [release_metadata, release_github_verify]
       runs-on: ubuntu-24.04
