@@ -869,7 +869,7 @@ installed on this host. Package license and NOTICE/ThirdPartyNotices payloads
 are read from the frozen install; generation fails explicitly when an
 unreviewed source payload is unavailable.
 
-BUNDLED/DISTRIBUTED (97)
+BUNDLED/DISTRIBUTED (100)
 ------------------------
 - @babel/code-frame 7.29.7 — MIT
 - @babel/generator 7.29.8 — MIT
@@ -885,6 +885,7 @@ BUNDLED/DISTRIBUTED (97)
 - @jridgewell/sourcemap-codec 1.5.5 — MIT
 - @jridgewell/trace-mapping 0.3.31 — MIT
 - @kurkle/color 0.3.4 — MIT
+- @modelcontextprotocol/sdk 1.30.0 — MIT
 - @opentelemetry/api 1.9.1 — Apache-2.0
 - @opentelemetry/api-logs 0.220.0 — Apache-2.0
 - @opentelemetry/context-async-hooks 2.10.0 — Apache-2.0
@@ -968,6 +969,8 @@ BUNDLED/DISTRIBUTED (97)
 - yargs 18.1.0 — MIT
 - yargs-parser 22.0.0 — ISC
 - zod 3.25.76 — MIT
+- zod 4.4.3 — MIT
+- zod-to-json-schema 3.25.2 — ISC
 
 DOWNLOADED-AT-RUNTIME (84)
 --------------------------
@@ -9595,6 +9598,7 @@ THIS SOFTWARE.
 Payload SHA-256: 3f1189b28e3866e0d979968d466b78f813f76827cfdca1fbb124cc0a5c8841f8
 Used by:
 - zod@3.25.76: LICENSE
+- zod@4.4.3: LICENSE
 
 MIT License
 
@@ -9723,6 +9727,33 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+-------------------------------------------------------------------------------
+Payload SHA-256: 5e13dbbc1d120fc2a03cecde7c91424ae2d7de11b63d58ded2f4431e261ee50d
+Used by:
+- @modelcontextprotocol/sdk@1.30.0: LICENSE
+
+MIT License
+
+Copyright (c) 2024 Anthropic, PBC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 -------------------------------------------------------------------------------
 Payload SHA-256: 5ff46083b88563822b0560dd6221ab89d2f74bc97a52d4c97a75020fd62c6f32
@@ -9858,6 +9889,27 @@ Used by:
 // THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+-------------------------------------------------------------------------------
+Payload SHA-256: 80d3168ad2f70f6f5bb2ab22b23414707abf6f0a392034891481ae36a1a429d4
+Used by:
+- zod-to-json-schema@3.25.2: LICENSE
+
+ISC License
+
+Copyright (c) 2020, Stefan Terdell
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 -------------------------------------------------------------------------------
 Payload SHA-256: 89ba0032731489153d552db918b727feb05128cf9eca20092875a9ad14147671

@@ -7,6 +7,13 @@ import {
 	BUILTIN_BLOB_DESTINATIONS,
 } from "../blob-broker/destinations";
 import { DEFAULT_RELAY_URL } from "../collab/protocol";
+import {
+	HINDSIGHT_DEFAULT_RECALL_TYPES,
+	HINDSIGHT_DEFAULTS,
+	HINDSIGHT_RECALL_BUDGETS,
+	HINDSIGHT_RETAIN_MODES,
+	HINDSIGHT_SCOPING_VALUES,
+} from "../hindsight/defaults";
 import { DEFAULT_LIVE_VOICE, LIVE_VOICE_OPTIONS, LIVE_VOICE_VALUES } from "../live/voices";
 import {
 	COMPACTION_METHOD_CHOICES,
@@ -403,7 +410,6 @@ const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const DEFAULT_CYCLE_ORDER: string[] = ["smol", "default", "slow"];
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["hub"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
-const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
 export const DEFAULT_BASH_INTERCEPTOR_RULES: BashInterceptorRule[] = [
 	{
 		pattern: "^\\s*(cat|head|tail|less|more)\\s+",
@@ -3260,7 +3266,7 @@ export const SETTINGS_SCHEMA = {
 	// Hindsight (https://hindsight.vectorize.io)
 	"hindsight.apiUrl": {
 		type: "string",
-		default: "http://localhost:8888",
+		default: HINDSIGHT_DEFAULTS.hindsightApiUrl ?? undefined,
 		ui: {
 			tab: "memory",
 			group: "Hindsight",
@@ -3298,8 +3304,8 @@ export const SETTINGS_SCHEMA = {
 	"hindsight.bankIdPrefix": { type: "string", default: undefined },
 	"hindsight.scoping": {
 		type: "enum",
-		values: ["global", "per-project", "per-project-tagged"] as const,
-		default: "per-project-tagged",
+		values: HINDSIGHT_SCOPING_VALUES,
+		default: HINDSIGHT_DEFAULTS.scoping,
 		ui: {
 			tab: "memory",
 			group: "Hindsight",
@@ -3332,7 +3338,7 @@ export const SETTINGS_SCHEMA = {
 
 	"hindsight.autoRecall": {
 		type: "boolean",
-		default: true,
+		default: HINDSIGHT_DEFAULTS.autoRecall,
 		ui: {
 			tab: "memory",
 			group: "Hindsight",
@@ -3343,7 +3349,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"hindsight.autoRetain": {
 		type: "boolean",
-		default: true,
+		default: HINDSIGHT_DEFAULTS.autoRetain,
 		ui: {
 			tab: "memory",
 			group: "Hindsight",
@@ -3355,8 +3361,8 @@ export const SETTINGS_SCHEMA = {
 
 	"hindsight.retainMode": {
 		type: "enum",
-		values: ["full-session", "last-turn"] as const,
-		default: "full-session",
+		values: HINDSIGHT_RETAIN_MODES,
+		default: HINDSIGHT_DEFAULTS.retainMode,
 		ui: {
 			tab: "memory",
 			group: "Hindsight",
@@ -3373,30 +3379,30 @@ export const SETTINGS_SCHEMA = {
 			condition: "hindsightActive",
 		},
 	},
-	"hindsight.retainEveryNTurns": { type: "number", default: 3 },
-	"hindsight.retainOverlapTurns": { type: "number", default: 2 },
-	"hindsight.retainContext": { type: "string", default: "omp" },
+	"hindsight.retainEveryNTurns": { type: "number", default: HINDSIGHT_DEFAULTS.retainEveryNTurns },
+	"hindsight.retainOverlapTurns": { type: "number", default: HINDSIGHT_DEFAULTS.retainOverlapTurns },
+	"hindsight.retainContext": { type: "string", default: HINDSIGHT_DEFAULTS.retainContext },
 
 	"hindsight.recallBudget": {
 		type: "enum",
-		values: ["low", "mid", "high"] as const,
-		default: "mid",
+		values: HINDSIGHT_RECALL_BUDGETS,
+		default: HINDSIGHT_DEFAULTS.recallBudget,
 	},
-	"hindsight.recallMaxTokens": { type: "number", default: 1024 },
-	"hindsight.recallContextTurns": { type: "number", default: 1 },
-	"hindsight.recallMaxQueryChars": { type: "number", default: 800 },
-	"hindsight.recallTypes": { type: "array", default: HINDSIGHT_RECALL_TYPES_DEFAULT },
+	"hindsight.recallMaxTokens": { type: "number", default: HINDSIGHT_DEFAULTS.recallMaxTokens },
+	"hindsight.recallContextTurns": { type: "number", default: HINDSIGHT_DEFAULTS.recallContextTurns },
+	"hindsight.recallMaxQueryChars": { type: "number", default: HINDSIGHT_DEFAULTS.recallMaxQueryChars },
+	"hindsight.recallTypes": { type: "array", default: HINDSIGHT_DEFAULT_RECALL_TYPES },
 
-	"hindsight.debug": { type: "boolean", default: false },
+	"hindsight.debug": { type: "boolean", default: HINDSIGHT_DEFAULTS.debug },
 
-	"hindsight.requestTimeoutMs": { type: "number", default: 30_000 },
-	"hindsight.reflectTimeoutMs": { type: "number", default: 120_000 },
-	"hindsight.recallTimeoutMs": { type: "number", default: 30_000 },
-	"hindsight.retainTimeoutMs": { type: "number", default: 60_000 },
+	"hindsight.requestTimeoutMs": { type: "number", default: HINDSIGHT_DEFAULTS.requestTimeoutMs },
+	"hindsight.reflectTimeoutMs": { type: "number", default: HINDSIGHT_DEFAULTS.reflectTimeoutMs },
+	"hindsight.recallTimeoutMs": { type: "number", default: HINDSIGHT_DEFAULTS.recallTimeoutMs },
+	"hindsight.retainTimeoutMs": { type: "number", default: HINDSIGHT_DEFAULTS.retainTimeoutMs },
 
 	"hindsight.mentalModelsEnabled": {
 		type: "boolean",
-		default: true,
+		default: HINDSIGHT_DEFAULTS.mentalModelsEnabled,
 		ui: {
 			tab: "memory",
 			group: "Hindsight",
@@ -3408,7 +3414,7 @@ export const SETTINGS_SCHEMA = {
 	},
 	"hindsight.mentalModelAutoSeed": {
 		type: "boolean",
-		default: true,
+		default: HINDSIGHT_DEFAULTS.mentalModelAutoSeed,
 		ui: {
 			tab: "memory",
 			group: "Hindsight",
@@ -3418,8 +3424,14 @@ export const SETTINGS_SCHEMA = {
 			condition: "hindsightActive",
 		},
 	},
-	"hindsight.mentalModelRefreshIntervalMs": { type: "number", default: 5 * 60 * 1000 },
-	"hindsight.mentalModelMaxRenderChars": { type: "number", default: 16_000 },
+	"hindsight.mentalModelRefreshIntervalMs": {
+		type: "number",
+		default: HINDSIGHT_DEFAULTS.mentalModelRefreshIntervalMs,
+	},
+	"hindsight.mentalModelMaxRenderChars": {
+		type: "number",
+		default: HINDSIGHT_DEFAULTS.mentalModelMaxRenderChars,
+	},
 
 	// TTSR
 	"ttsr.enabled": {

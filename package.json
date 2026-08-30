@@ -22,6 +22,7 @@
       "@babel/types": "^7.29.7",
       "@biomejs/biome": "^2.5.3",
       "@huggingface/transformers": "^4.2.0",
+      "@modelcontextprotocol/sdk": "^1.30.0",
       "@napi-rs/cli": "3.7.2",
       "@oh-my-pi/hashline": "18.0.11",
       "@oh-my-pi/omp-stats": "18.0.11",
@@ -75,7 +76,8 @@
       "ts-morph": "^28.0.0",
       "typescript": "^7.0.2",
       "vite": "^8.1.4",
-      "vite-plugin-solid": "^2.11.12"
+      "vite-plugin-solid": "^2.11.12",
+      "zod": "^3.25.76"
     }
   },
   "overrides": {
@@ -94,12 +96,13 @@
     "claude:trace": "bun scripts/claude-trace.ts",
     "build": "bun run --workspaces --if-present build",
     "build:native": "bun --cwd=packages/natives run build",
+    "build:hindsight-agent-bridge": "bun packages/coding-agent/scripts/build-hindsight-agent-bridge.ts",
     "test": "bun scripts/ci-test-ts.ts local",
     "test:ts": "bun scripts/ci-test-ts.ts local-ts",
     "test:scripts": "bun test scripts/ci-test-ts.test.ts scripts/ci-release-build-binaries.test.ts scripts/musl-release.test.ts scripts/ci-release-publish.test.ts scripts/release.test.ts",
     "test:rs": "bun scripts/run-rs-task.ts test:rs",
     "check": "bun run --parallel check:ts check:rs",
-"check:ts": "bun run check:tools && bun run --workspaces --if-present check",
+    "check:ts": "bun run check:tools && bun run --workspaces --if-present check",
     "check:tools": "biome check . --no-errors-on-unmatched",
     "check:rs": "bun scripts/run-rs-task.ts check:rs",
     "lint": "bun run --parallel lint:ts lint:rs",
@@ -131,6 +134,7 @@
     "ci:test:smoke": "bun packages/coding-agent/src/cli.ts --version && bun packages/coding-agent/src/cli.ts --help && bun packages/coding-agent/src/cli.ts stats --help && bun packages/coding-agent/src/cli.ts --smoke-test",
     "ci:test:install-methods": "bash scripts/install-tests/run-ci.sh",
     "ci:release:build-binaries": "bun scripts/ci-release-build-binaries.ts",
+    "ci:release:build-hindsight-agent-bridge": "bun packages/coding-agent/scripts/build-hindsight-agent-bridge.ts",
     "ci:release:checksums": "bun scripts/ci-release-checksums.ts",
     "ci:release:publish": "bun scripts/ci-release-publish.ts",
     "ci:release:publish-native-leaf": "bun scripts/ci-release-publish.ts --native-leaf",

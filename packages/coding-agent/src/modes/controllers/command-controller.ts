@@ -954,6 +954,7 @@ export class CommandController {
 					retainTags: state.retainTags,
 					recallTags: state.recallTags,
 					recallTagsMatch: state.recallTagsMatch,
+					observationScopes: state.observationScopes,
 				},
 				config.scoping,
 			);

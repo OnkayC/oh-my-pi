@@ -1,0 +1,3 @@
+{"timestamp":"2026-08-30T11:00:00.000Z","role":"user","prompt_index":0,"content":"Remember beta decision"}
+{"timestamp":"2026-08-30T11:00:01.000Z","role":"assistant","content":[{"type":"text","text":"Beta is retained"}],"tool_calls":[{"function":{"name":"recall","arguments":"{\"query\":\"beta\"}"}}]}
+{"timestamp":"2026-08-30T11:00:02.000Z","role":"user","content":"missing prompt index"}

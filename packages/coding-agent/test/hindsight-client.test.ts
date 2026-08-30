@@ -57,4 +57,23 @@ describe("HindsightApi timestamp serialization", () => {
 
 		expect(firstTimestamp(bodies[0] ?? "{}")).toBe("2026-06-12T19:17:00+08:00");
 	});
+
+	it("serializes explicit observation scopes on single retains", async () => {
+		const bodies = captureRequestBodies();
+		const client = new HindsightApi({ baseUrl: "http://hindsight.local" });
+
+		await client.retain("coding-agents", "project memory", {
+			tags: ["project:config"],
+			observationScopes: [["project:config"]],
+		});
+
+		expect(JSON.parse(bodies[0] ?? "{}")).toMatchObject({
+			items: [
+				{
+					tags: ["project:config"],
+					observation_scopes: [["project:config"]],
+				},
+			],
+		});
+	});
 });

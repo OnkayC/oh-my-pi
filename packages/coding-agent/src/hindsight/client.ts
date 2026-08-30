@@ -8,7 +8,7 @@
  * tests to spy on.
  */
 
-import { USER_AGENT } from "@oh-my-pi/pi-utils";
+import { USER_AGENT } from "@oh-my-pi/pi-utils/dirs";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
 import type { HindsightConfig } from "./config";
 
@@ -107,6 +107,7 @@ export interface RetainOptions extends HindsightRequestOptions {
 	async?: boolean;
 	tags?: string[];
 	updateMode?: UpdateMode;
+	observationScopes?: MemoryItemInput["observationScopes"];
 }
 
 export interface RetainBatchOptions extends HindsightRequestOptions {
@@ -268,6 +269,7 @@ export class HindsightApi {
 			documentId: options?.documentId,
 			tags: options?.tags,
 			updateMode: options?.updateMode,
+			observationScopes: options?.observationScopes,
 		});
 
 		return this.#request<RetainResponse>(

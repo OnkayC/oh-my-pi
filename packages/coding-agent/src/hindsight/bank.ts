@@ -21,10 +21,10 @@
  */
 
 import * as path from "node:path";
-import * as vcs from "@oh-my-pi/pi-natives/vcs";
-import { logger } from "@oh-my-pi/pi-utils";
+import * as logger from "@oh-my-pi/pi-utils/logger";
 import type { HindsightApi } from "./client";
 import type { HindsightConfig } from "./config";
+import { resolvePrimaryProjectRoot } from "./project-root";
 
 const DEFAULT_BANK_NAME = "omp";
 const PROJECT_TAG_PREFIX = "project:";
@@ -45,6 +45,8 @@ export interface BankScope {
 	recallTags?: string[];
 	/** Match mode for `recallTags`. Defaults to `any` so untagged ("global") memories surface too. */
 	recallTagsMatch?: RecallTagsMatch;
+	/** Scopes assigned to observations extracted from project-tagged retains. */
+	observationScopes?: string[][];
 }
 
 /** Compose the prefixed base bank id (no project segment). */
@@ -59,7 +61,7 @@ function baseBankId(config: HindsightConfig): string {
  *
  * When `directory` lives inside a repository we resolve the primary
  * checkout root (or the shared common dir for bare-repo worktrees) via
- * the native VCS adapter and basename that, so every linked
+ * {@link resolvePrimaryProjectRoot} and basename that, so every linked
  * worktree of one repo shares the same `project:<name>` tag.
  * Outside a repo (or when resolution fails), fall back to the cwd basename.
  *
@@ -68,13 +70,12 @@ function baseBankId(config: HindsightConfig): string {
  * `project:General` scope that never meets the `project:general` scope every
  * other client of the same bank reads and writes.
  *
- * Sync only: this runs on the hot path of `computeBankScope`, which is
- * exposed as a sync API to callers like `backend.ts` and must stay sync.
- * Native repository discovery never launches a subprocess.
+ * Sync only: this runs on the hot path of `computeBankScope`. The helper walks
+ * `.git`/`commondir` with bounded synchronous file reads and no subprocesses.
  */
 function projectLabel(directory: string): string {
 	if (!directory) return UNKNOWN_PROJECT;
-	const primary = vcs.repo(directory)?.primaryRoot() ?? null;
+	const primary = resolvePrimaryProjectRoot(directory);
 	return path.basename(primary ?? directory).toLowerCase() || UNKNOWN_PROJECT;
 }
 
@@ -100,6 +101,7 @@ export function computeBankScope(config: HindsightConfig, directory: string): Ba
 				// `any` keeps untagged "global" memories visible alongside the
 				// project-tagged ones; flip to `*_strict` to harden isolation.
 				recallTagsMatch: "any",
+				observationScopes: [[tag]],
 			};
 		}
 	}

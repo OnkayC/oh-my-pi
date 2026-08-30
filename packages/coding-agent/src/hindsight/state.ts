@@ -1,4 +1,4 @@
-import { logger } from "@oh-my-pi/pi-utils";
+import * as logger from "@oh-my-pi/pi-utils/logger";
 import type { AgentSession } from "../session/agent-session";
 import { type BankScope, ensureBankExists } from "./bank";
 import type { HindsightApi, MemoryItemInput } from "./client";
@@ -44,6 +44,7 @@ export interface HindsightSessionStateOptions {
 	/** Tag filter applied to every recall/reflect — non-empty in per-project-tagged mode. */
 	recallTags?: string[];
 	recallTagsMatch?: "any" | "all" | "any_strict" | "all_strict";
+	observationScopes?: string[][];
 	config: HindsightConfig;
 	session: AgentSession;
 	banksSet: Set<string>;
@@ -156,6 +157,7 @@ export class HindsightRetainQueue {
 				metadata: { session_id: sessionId },
 				tags: state.retainTags,
 				timestamp: item.timestamp,
+				observationScopes: state.observationScopes,
 			}));
 			await state.client.retainBatch(state.bankId, batch, { async: true });
 			if (state.config.debug) {
@@ -209,6 +211,7 @@ export class HindsightSessionState {
 	/** Tag filter applied to every recall/reflect — non-empty in per-project-tagged mode. */
 	recallTags?: string[];
 	recallTagsMatch?: "any" | "all" | "any_strict" | "all_strict";
+	observationScopes?: string[][];
 	config: HindsightConfig;
 	session: AgentSession;
 	banksSet: Set<string>;
@@ -254,6 +257,7 @@ export class HindsightSessionState {
 		this.retainTags = options.retainTags;
 		this.recallTags = options.recallTags;
 		this.recallTagsMatch = options.recallTagsMatch;
+		this.observationScopes = options.observationScopes;
 		this.config = options.config;
 		this.session = options.session;
 		this.banksSet = options.banksSet;
@@ -364,6 +368,7 @@ export class HindsightSessionState {
 			tags: this.retainTags,
 			timestamp: sourceTimestamp,
 			async: true,
+			observationScopes: this.observationScopes,
 		});
 		if (nextCachedTranscript !== undefined) {
 			this.#cachedTranscript = nextCachedTranscript;

@@ -94,6 +94,7 @@ describe("computeBankScope", () => {
 			expect(scope.retainTags).toBeUndefined();
 			expect(scope.recallTags).toBeUndefined();
 			expect(scope.recallTagsMatch).toBeUndefined();
+			expect(scope.observationScopes).toBeUndefined();
 		});
 	});
 
@@ -138,6 +139,7 @@ describe("computeBankScope", () => {
 				retainTags: ["project:proj"],
 				recallTags: ["project:proj"],
 				recallTagsMatch: "any",
+				observationScopes: [["project:proj"]],
 			});
 		});
 

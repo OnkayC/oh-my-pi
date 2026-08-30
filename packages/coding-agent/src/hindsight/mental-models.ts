@@ -39,7 +39,7 @@
  * followed by a re-seed.
  */
 
-import { logger } from "@oh-my-pi/pi-utils";
+import * as logger from "@oh-my-pi/pi-utils/logger";
 import type { BankScope } from "./bank";
 import type {
 	HindsightApi,
@@ -227,7 +227,7 @@ export async function loadMentalModelsBlock(
 	}
 
 	const models = (response.items ?? []).filter(
-		m => modelVisibleForTags(m, visibleTags) && typeof m.content === "string" && m.content.trim().length > 0,
+		m => mentalModelVisibleForTags(m, visibleTags) && typeof m.content === "string" && m.content.trim().length > 0,
 	);
 	if (models.length === 0) return undefined;
 
@@ -236,7 +236,7 @@ export async function loadMentalModelsBlock(
 	return block || undefined;
 }
 
-function modelVisibleForTags(model: MentalModelSummary, visibleTags?: readonly string[]): boolean {
+export function mentalModelVisibleForTags(model: MentalModelSummary, visibleTags?: readonly string[]): boolean {
 	if (!visibleTags || visibleTags.length === 0) return true;
 	const tags = model.tags ?? [];
 	if (tags.length === 0) return true;
