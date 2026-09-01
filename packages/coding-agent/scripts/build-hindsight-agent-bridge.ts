@@ -4,12 +4,13 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 export interface BridgeBuildTarget {
-	id: "darwin-arm64" | "linux-x64" | "linux-arm64";
+	id: "darwin-arm64" | "darwin-x64" | "linux-x64" | "linux-arm64";
 	compileTarget: Bun.Build.CompileTarget;
 }
 
 export const BRIDGE_BUILD_TARGETS: readonly BridgeBuildTarget[] = [
 	{ id: "darwin-arm64", compileTarget: "bun-darwin-arm64" },
+	{ id: "darwin-x64", compileTarget: "bun-darwin-x64" },
 	{ id: "linux-x64", compileTarget: "bun-linux-x64-modern" },
 	{ id: "linux-arm64", compileTarget: "bun-linux-arm64" },
 ];
@@ -21,6 +22,7 @@ const entrypoint = path.join(packageDir, "src", "hindsight-agent-bridge", "cli.t
 
 function hostTargetId(): BridgeBuildTarget["id"] {
 	if (process.platform === "darwin" && process.arch === "arm64") return "darwin-arm64";
+	if (process.platform === "darwin" && process.arch === "x64") return "darwin-x64";
 	if (process.platform === "linux" && process.arch === "x64") return "linux-x64";
 	if (process.platform === "linux" && process.arch === "arm64") return "linux-arm64";
 	throw new Error(`Unsupported Hindsight bridge build host: ${process.platform}-${process.arch}`);
@@ -76,7 +78,7 @@ export async function buildHindsightAgentBridge(
 				`Hindsight bridge build failed for ${target.id}:\n${result.logs.map(log => log.message).join("\n")}`,
 			);
 		}
-		if (target.id === "darwin-arm64" && process.platform === "darwin") {
+		if (target.id.startsWith("darwin-") && process.platform === "darwin") {
 			const signer = Bun.spawn(["codesign", "--force", "--sign", "-", outfile], {
 				stdout: "ignore",
 				stderr: "pipe",
