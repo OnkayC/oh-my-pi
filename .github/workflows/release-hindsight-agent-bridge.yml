@@ -33,6 +33,11 @@ jobs:
                     binary_path: packages/coding-agent/binaries/hindsight-agent-bridge-linux-arm64,
                  }
                - {
+                    os: macos-15-intel,
+                    target_id: darwin-x64,
+                    binary_path: packages/coding-agent/binaries/hindsight-agent-bridge-darwin-x64,
+                 }
+               - {
                     os: macos-14,
                     target_id: darwin-arm64,
                     binary_path: packages/coding-agent/binaries/hindsight-agent-bridge-darwin-arm64,
@@ -61,7 +66,7 @@ jobs:
               RELEASE_TARGETS: ${{ matrix.target_id }}
            run: bun run ci:release:build-hindsight-agent-bridge
          - name: Sign and notarize macOS bridge
-           if: matrix.target_id == 'darwin-arm64' && env.MACOS_SIGNING == 'true'
+           if: startsWith(matrix.target_id, 'darwin-') && env.MACOS_SIGNING == 'true'
            env:
               APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
               APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -118,6 +123,7 @@ jobs:
               bun run ci:release:checksums \
                 packages/coding-agent/binaries/SHA256SUMS.txt \
                 packages/coding-agent/binaries/hindsight-agent-bridge-darwin-arm64 \
+                packages/coding-agent/binaries/hindsight-agent-bridge-darwin-x64 \
                 packages/coding-agent/binaries/hindsight-agent-bridge-linux-arm64 \
                 packages/coding-agent/binaries/hindsight-agent-bridge-linux-x64
          - name: Create GitHub release
@@ -132,24 +138,32 @@ jobs:
                  THIRD-PARTY-NOTICES.txt
 
    verify-macos:
-      name: Verify published macOS bridge
+      name: "Verify published bridge: ${{ matrix.target_id }}"
       needs: [publish]
-      runs-on: macos-14
+      strategy:
+         fail-fast: false
+         matrix:
+            include:
+               - { os: macos-15-intel, target_id: darwin-x64 }
+               - { os: macos-14, target_id: darwin-arm64 }
+      runs-on: ${{ matrix.os }}
       permissions:
          contents: read
+      env:
+         BRIDGE_BINARY: hindsight-agent-bridge-${{ matrix.target_id }}
       steps:
          - name: Download published bridge
            shell: bash
            run: |
-              curl -fsSL -o hindsight-agent-bridge-darwin-arm64 "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hindsight-agent-bridge-darwin-arm64"
-              curl -fsSL -o hindsight-agent-bridge-darwin-arm64.sha256 "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hindsight-agent-bridge-darwin-arm64.sha256"
-              chmod +x hindsight-agent-bridge-darwin-arm64
+              curl -fsSL -o "$BRIDGE_BINARY" "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$BRIDGE_BINARY"
+              curl -fsSL -o "$BRIDGE_BINARY.sha256" "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$BRIDGE_BINARY.sha256"
+              chmod +x "$BRIDGE_BINARY"
          - name: Verify published bridge
            shell: bash
            run: |
-              shasum -a 256 -c hindsight-agent-bridge-darwin-arm64.sha256
-              codesign -dvvv ./hindsight-agent-bridge-darwin-arm64
-              codesign --verify --strict --verbose=4 ./hindsight-agent-bridge-darwin-arm64
+              shasum -a 256 -c "$BRIDGE_BINARY.sha256"
+              codesign -dvvv "./$BRIDGE_BINARY"
+              codesign --verify --strict --verbose=4 "./$BRIDGE_BINARY"
               runtime_dir="$(mktemp -d)"
               cat > "$runtime_dir/config.json" <<'EOF'
               {
@@ -161,5 +175,5 @@ jobs:
               }
               EOF
               chmod 600 "$runtime_dir/config.json"
-              ./hindsight-agent-bridge-darwin-arm64 --version
-              HINDSIGHT_BRIDGE_CONFIG="$runtime_dir/config.json" ./hindsight-agent-bridge-darwin-arm64 diagnose --cwd "$GITHUB_WORKSPACE" --json
+              "./$BRIDGE_BINARY" --version
+              HINDSIGHT_BRIDGE_CONFIG="$runtime_dir/config.json" "./$BRIDGE_BINARY" diagnose --cwd "$GITHUB_WORKSPACE" --json

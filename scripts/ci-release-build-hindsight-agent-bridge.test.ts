@@ -10,11 +10,16 @@ import {
 const repoRoot = path.join(import.meta.dir, "..");
 
 describe("Hindsight agent bridge release build", () => {
-	it("supports only the three published targets with stable asset names", () => {
-		expect(BRIDGE_BUILD_TARGETS.map(target => target.id)).toEqual(["darwin-arm64", "linux-x64", "linux-arm64"]);
-		expect(resolveBridgeBuildTargets("linux-arm64,darwin-arm64,linux-arm64").map(target => target.id)).toEqual([
-			"linux-arm64",
+	it("supports the four published targets with stable asset names", () => {
+		expect(BRIDGE_BUILD_TARGETS.map(target => target.id)).toEqual([
 			"darwin-arm64",
+			"darwin-x64",
+			"linux-x64",
+			"linux-arm64",
+		]);
+		expect(resolveBridgeBuildTargets("linux-arm64,darwin-x64,linux-arm64").map(target => target.id)).toEqual([
+			"linux-arm64",
+			"darwin-x64",
 		]);
 		for (const target of BRIDGE_BUILD_TARGETS) {
 			expect(path.basename(bridgeAssetPath(target))).toBe(`hindsight-agent-bridge-${target.id}`);
@@ -25,7 +30,7 @@ describe("Hindsight agent bridge release build", () => {
 	it("dry-runs direct Bun compilation without native or OMP bundle generation", async () => {
 		const result = await $`bun packages/coding-agent/scripts/build-hindsight-agent-bridge.ts --dry-run`
 			.cwd(repoRoot)
-			.env({ ...process.env, RELEASE_TARGETS: "darwin-arm64,linux-x64,linux-arm64" })
+			.env({ ...process.env, RELEASE_TARGETS: "darwin-arm64,darwin-x64,linux-x64,linux-arm64" })
 			.quiet()
 			.nothrow();
 		expect(result.exitCode).toBe(0);
@@ -37,5 +42,13 @@ describe("Hindsight agent bridge release build", () => {
 		expect(output).not.toContain("gen:native");
 		expect(output).not.toContain("compileCodingAgent");
 		expect(output).not.toContain("docs-index");
+	});
+
+	it("keeps the release workflow aligned with every build target", async () => {
+		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/release-hindsight-agent-bridge.yml")).text();
+		for (const target of BRIDGE_BUILD_TARGETS) {
+			expect(workflow).toContain(`target_id: ${target.id}`);
+			expect(workflow).toContain(`packages/coding-agent/binaries/hindsight-agent-bridge-${target.id}`);
+		}
 	});
 });
