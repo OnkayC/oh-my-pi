@@ -62,4 +62,14 @@ describe("Hindsight agent bridge release build", () => {
 		expect(output).not.toContain("compileCodingAgent");
 		expect(output).not.toContain("docs-index");
 	});
+
+	it("keeps the release workflow aligned with every build target", async () => {
+		const workflow = await Bun.file(
+			path.join(repoRoot, ".github/workflows/release-hindsight-agent-bridge.yml"),
+		).text();
+		for (const target of BRIDGE_BUILD_TARGETS) {
+			expect(workflow).toContain(`target_id: ${target.id}`);
+			expect(workflow).toContain(`packages/coding-agent/binaries/hindsight-agent-bridge-${target.id}`);
+		}
+	});
 });

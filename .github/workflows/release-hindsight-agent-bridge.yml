@@ -149,6 +149,8 @@ jobs:
       runs-on: ${{ matrix.os }}
       permissions:
          contents: read
+      env:
+         BRIDGE_BINARY: hindsight-agent-bridge-${{ matrix.target_id }}
       steps:
          - name: Download published bridge
            shell: bash
