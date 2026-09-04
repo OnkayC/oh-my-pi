@@ -142,6 +142,25 @@ describe("Hindsight bridge lifecycle hooks", () => {
 		expect(recallRequests[0].body).toMatchObject({ tags: ["project:config"], tags_match: "any" });
 	});
 
+	it("recalls on every Amp prompt", async () => {
+		await writeBridgeConfig();
+		await handleHook("amp", "session-start", { session_id: "amp-recall", cwd: "/work/config" });
+		const first = await handleHook("amp", "user-prompt-submit", {
+			session_id: "amp-recall",
+			cwd: "/work/config",
+			prompt: "What did we decide?",
+		});
+		const second = await handleHook("amp", "user-prompt-submit", {
+			session_id: "amp-recall",
+			cwd: "/work/config",
+			prompt: "What else?",
+		});
+
+		expect(first?.hookSpecificOutput.additionalContext).toContain("Alpha policy");
+		expect(second?.hookSpecificOutput.additionalContext).toContain("Alpha policy");
+		expect(requests.filter(request => request.path.endsWith("/memories/recall"))).toHaveLength(2);
+	});
+
 	it("retains Codex and Grok transcripts with replace semantics and project observation scope", async () => {
 		await writeBridgeConfig();
 		const fixtureRoot = path.join(import.meta.dir, "fixtures", "hindsight-agent-bridge");
@@ -191,5 +210,34 @@ describe("Hindsight bridge lifecycle hooks", () => {
 			}),
 		).rejects.toThrow("retain failed");
 		expect(await readHookState("codex", "retry-stop")).toBeDefined();
+	});
+
+	it("retains Amp's inline transcript with Amp provenance", async () => {
+		await writeBridgeConfig();
+		await handleHook("amp", "session-start", { session_id: "amp-stop", cwd: "/work/config" });
+		await handleHook("amp", "stop", {
+			session_id: "amp-stop",
+			cwd: "/work/config",
+			messages: [
+				{ role: "user", content: "Remember the Amp decision", timestamp: "2026-09-04T01:00:00.000Z" },
+				{ role: "assistant", content: "The Amp decision is retained" },
+			],
+		});
+
+		const retained = requests.find(
+			request => request.method === "POST" && request.path.endsWith("/memories") && request.body?.items,
+		);
+		expect(retained?.body).toMatchObject({
+			items: [
+				{
+					metadata: { session_id: "amp-stop", harness: "amp", cwd: "/work/config" },
+					tags: ["project:config"],
+					observation_scopes: [["project:config"]],
+					update_mode: "replace",
+				},
+			],
+		});
+		expect(JSON.stringify(retained?.body)).toContain("Remember the Amp decision");
+		expect(await Bun.file(hookStatePath("amp", "amp-stop")).exists()).toBe(false);
 	});
 });

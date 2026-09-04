@@ -9,7 +9,7 @@ import { createBridgeRuntime, ensureBridgeBankAndModels, listVisibleMentalModels
 import skillText from "./SKILL.md" with { type: "text" };
 
 const VERSION = packageJson.version;
-const HARNESSES: readonly BridgeHarness[] = ["codex", "grok"];
+const HARNESSES: readonly BridgeHarness[] = ["amp", "codex", "grok"];
 const HOOK_EVENTS: readonly HookEvent[] = ["session-start", "user-prompt-submit", "stop"];
 
 function requiredChoice<T extends string>(value: string | undefined, choices: readonly T[], label: string): T {
@@ -123,7 +123,7 @@ export async function runBridgeCli(args: string[] = process.argv.slice(2)): Prom
 				return 0;
 			default:
 				throw new Error(
-					"Usage: hindsight-agent-bridge --version | diagnose [--cwd PATH] [--online] --json | mcp | hook <codex|grok> <session-start|user-prompt-submit|stop> | skill",
+					"Usage: hindsight-agent-bridge --version | diagnose [--cwd PATH] [--online] --json | mcp | hook <amp|codex|grok> <session-start|user-prompt-submit|stop> | skill",
 				);
 		}
 	} catch (error) {

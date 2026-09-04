@@ -3,6 +3,7 @@ import {
 	composeRecallQuery,
 	formatCurrentTime,
 	formatMemories,
+	type HindsightMessage,
 	prepareRetentionTranscript,
 	truncateRecallQuery,
 } from "../hindsight/content";
@@ -26,6 +27,7 @@ interface NormalizedHookInput {
 	cwd: string;
 	prompt?: string;
 	transcriptPath?: string;
+	messages?: HindsightMessage[];
 }
 
 function inputRecord(input: unknown): Record<string, unknown> {
@@ -44,14 +46,28 @@ function optionalString(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
 }
 
+function inlineMessages(value: unknown): HindsightMessage[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error("Hook payload messages must be an array.");
+	return value.map((item, index) => {
+		const message = inputRecord(item);
+		return {
+			role: requiredString(message.role, `messages[${index}].role`),
+			content: requiredString(message.content, `messages[${index}].content`),
+			timestamp: optionalString(message.timestamp),
+		};
+	});
+}
+
 function normalizeHookInput(harness: BridgeHarness, input: unknown): NormalizedHookInput {
 	const record = inputRecord(input);
-	if (harness === "codex") {
+	if (harness === "codex" || harness === "amp") {
 		return {
 			sessionId: requiredString(record.session_id, "session_id"),
 			cwd: requiredString(record.cwd, "cwd"),
 			prompt: optionalString(record.prompt ?? record.user_prompt),
-			transcriptPath: optionalString(record.transcript_path),
+			transcriptPath: harness === "codex" ? optionalString(record.transcript_path) : undefined,
+			messages: harness === "amp" ? inlineMessages(record.messages) : undefined,
 		};
 	}
 	return {
@@ -101,7 +117,7 @@ async function userPromptSubmit(harness: BridgeHarness, input: NormalizedHookInp
 		state = newHookState(harness, input, runtime.scope);
 		await writeHookState(state);
 	}
-	if (state.recallAttempted || !input.prompt) return undefined;
+	if ((harness !== "amp" && state.recallAttempted) || !input.prompt) return undefined;
 	const runtime = await runtimeForState(state);
 	const query = composeRecallQuery(
 		input.prompt,
@@ -135,14 +151,23 @@ async function stop(harness: BridgeHarness, input: NormalizedHookInput): Promise
 		await writeHookState(state);
 	}
 	const runtime = await runtimeForState(state);
-	const transcriptPath =
-		harness === "codex"
-			? requiredString(input.transcriptPath, "transcript_path")
-			: await resolveGrokTranscriptPath(state.cwd, state.sessionId);
-	const messages =
-		harness === "codex" ? await parseCodexTranscript(transcriptPath) : await parseGrokTranscript(transcriptPath);
+	let messages: HindsightMessage[];
+	let transcriptSource: string;
+	if (harness === "amp") {
+		if (!input.messages) throw new Error("Hook payload is missing messages.");
+		messages = input.messages;
+		transcriptSource = "Amp hook payload";
+	} else {
+		const transcriptPath =
+			harness === "codex"
+				? requiredString(input.transcriptPath, "transcript_path")
+				: await resolveGrokTranscriptPath(state.cwd, state.sessionId);
+		messages =
+			harness === "codex" ? await parseCodexTranscript(transcriptPath) : await parseGrokTranscript(transcriptPath);
+		transcriptSource = transcriptPath;
+	}
 	const { transcript } = prepareRetentionTranscript(messages, true, { includeTimestamps: true });
-	if (!transcript) throw new Error(`Transcript contains no retainable messages: ${transcriptPath}`);
+	if (!transcript) throw new Error(`Transcript contains no retainable messages: ${transcriptSource}`);
 	await ensureBankExists(runtime.client, runtime.scope.bankId, runtime.config.hindsight, runtime.banksSet);
 	await runtime.client.retain(runtime.scope.bankId, transcript, {
 		documentId: state.sessionId,
