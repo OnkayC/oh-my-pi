@@ -11,6 +11,7 @@ import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
+import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS,
 	formatBackgroundNotice,
@@ -45,6 +46,8 @@ import { expandInternalUrls, type InternalUrlExpansionOptions } from "./bash-ski
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand } from "./gh-cache-invalidation";
 import {
+	formatArtifactErrorNotice,
+	formatOutputNotice,
 	formatStyledTruncationWarning,
 	type OutputMeta,
 	resolveInlineByteCapBudget,
@@ -59,7 +62,7 @@ import {
 	previewWindowRows,
 	replaceTabs,
 } from "./render-utils";
-import { extractLeadingCdTarget, tokenizeShellSegments } from "./shell-tokenize";
+import { extractLeadingCdTarget, extractLiteralAndChainSegments, tokenizeShellSegments } from "./shell-tokenize";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
@@ -592,11 +595,37 @@ function stripBackgroundNotice(text: string, async: BashToolDetails["async"] | u
  */
 export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSchemaWithAsync, BashToolDetails> {
 	readonly name = "bash";
+	/** Bash resolves `skill://` URIs in commands and working directories. */
+	readonly readsSkillUris = true;
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
 		const patternRules = getBashApprovalPatternRules(this.session.settings.get("bash.patterns"));
-		const patternRule = findBashApprovalPatternRule(command, patternRules);
+		const shell = this.session.settings.get("bash.allowCompoundCommands")
+			? this.session.settings.getShellConfig().shell
+			: undefined;
+		const compoundSegments = shell && isPosixShell(shell) ? extractLiteralAndChainSegments(command) : null;
+		// Segment rules keep their ordered first-match semantics. Restrictions
+		// matching only the complete chain are aggregated separately: retain the
+		// first prompt, but keep scanning because any later deny takes precedence.
+		let patternRule: BashApprovalPatternRule | undefined;
+		if (compoundSegments) {
+			for (const rule of patternRules) {
+				if (
+					rule.approval !== "allow" &&
+					commandMatchesBashApprovalPattern(command, rule.match) &&
+					!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match))
+				) {
+					if (rule.approval === "deny") {
+						patternRule = rule;
+						break;
+					}
+					patternRule ??= rule;
+				}
+			}
+		} else {
+			patternRule = findBashApprovalPatternRule(command, patternRules);
+		}
 		if (patternRule?.approval === "deny") {
 			return {
 				tier: "exec",
@@ -605,8 +634,42 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				reason: `Blocked by bash pattern: ${patternRule.match}`,
 			};
 		}
-		if (command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command))) {
+		const criticalCommand = command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
+		if (!compoundSegments && criticalCommand) {
 			return { tier: "exec", override: true, reason: "Critical pattern detected" };
+		}
+		if (compoundSegments) {
+			let promptRule: BashApprovalPatternRule | undefined = patternRule;
+			let hasUnmatchedSegment = false;
+			for (const segment of compoundSegments) {
+				const segmentRule = findBashApprovalPatternRule(segment.text, patternRules);
+				if (segmentRule?.approval === "deny") {
+					return {
+						tier: "exec",
+						override: true,
+						policy: "deny",
+						reason: `Blocked by bash pattern: ${segmentRule.match}`,
+					};
+				}
+				if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
+				if (!segmentRule) hasUnmatchedSegment = true;
+			}
+			if (promptRule) {
+				return {
+					tier: "exec",
+					override: true,
+					policy: "prompt",
+					reason: `Prompt required by bash pattern: ${promptRule.match}`,
+				};
+			}
+			for (const segment of compoundSegments) {
+				const literalCommand = segment.argv.join(" ");
+				if (criticalCommand || CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(literalCommand))) {
+					return { tier: "exec", override: true, reason: "Critical pattern detected" };
+				}
+			}
+			// Unmatched segments retain the standalone tool-policy and mode fallback.
+			return hasUnmatchedSegment ? "exec" : { tier: "write", policy: "allow" };
 		}
 		if (patternRule?.approval === "allow") return { tier: "write", policy: "allow" };
 		if (patternRule?.approval === "prompt") {
@@ -638,6 +701,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			hasGrep: isToolActive("grep", this.session.settings.get("grep.enabled")),
 			hasGlob: isToolActive("glob", this.session.settings.get("glob.enabled")),
 			hasRead: isToolActive("read", true),
+			hasSkills:
+				// `skillful: false` removes the system-prompt catalog and must also
+				// strip the provider-side `skill://` hint, matching sdk.ts:3186.
+				this.session.settings.get("skillful") && (this.session.skills?.length ?? 0) > 0,
 			hasLaunch: isToolActive("hub", this.session.settings.get("launch.enabled")),
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			hasShellBuiltins: !shellBuiltinsDisabled(this.session.settings),
@@ -688,22 +755,23 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		timeoutSec: number | undefined,
 		outputText: string,
 	): void {
+		const captureNotice = result.artifactError ? `\n\n[${formatArtifactErrorNotice(result.artifactError)}]` : "";
 		if (result.cancelled) {
 			// Local executor output already carries a leading `[Command cancelled]`
 			// notice from the sink; PTY/bridge output does not, so annotate only
 			// the latter.
 			const out = normalizeResultOutput(result);
 			const annotated = out.startsWith("[Command cancelled]") ? out : out ? `${out}\n\n[Command aborted]` : out;
-			throw new ToolError(annotated || "Command aborted");
+			throw new ToolError(`${annotated || "Command aborted"}${captureNotice}`);
 		}
 		if (result.timedOut === true) {
 			const out = normalizeResultOutput(result);
 			const message =
 				timeoutSec === undefined ? "Command timed out" : `Command timed out after ${timeoutSec} seconds`;
-			throw new ToolError(out ? `${out}\n\n[${message}]` : message);
+			throw new ToolError(`${out ? `${out}\n\n[${message}]` : message}${captureNotice}`);
 		}
 		if (result.exitCode === undefined) {
-			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status`);
+			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status${captureNotice}`);
 		}
 	}
 
@@ -765,7 +833,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		// `[raw output: artifact://N]` footer and the truncation notice agree.
 		const inlineCap = {
 			maxBytes: resolveInlineByteCapBudget(this.session.settings),
-			saveArtifact: (full: string) => result.artifactId ?? saveBashOriginalArtifact(this.session, full),
+			saveArtifact: result.artifactError
+				? undefined
+				: (full: string) => result.artifactId ?? saveBashOriginalArtifact(this.session, full),
 		};
 
 		if (isTimeout) {
@@ -831,7 +901,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 	}
 
 	#extractTextResult(result: AgentToolResult<BashToolDetails>): string {
-		return result.content.find(block => block.type === "text")?.text ?? "";
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+		return text + formatOutputNotice(result.details?.meta);
 	}
 
 	#startManagedBashJob(options: {
@@ -880,6 +951,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
+					if (result.artifactError) latestProgressDetails = { meta: { artifactError: result.artifactError } };
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -1000,6 +1072,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			internalRouter: InternalUrlRouter.instance(),
 			cwd: this.session.cwd,
 			sessionFile: this.session.getSessionFile() ?? undefined,
+			sessionId: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+			agentRegistry: this.session.agentRegistry,
 			rules: this.session.activeRules,
 			localOptions: {
 				getArtifactsDir: this.session.getArtifactsDir,
@@ -1023,8 +1097,10 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 			: undefined;
 
 		// Resolve protocol URLs (skill://, agent://, etc.) in extracted cwd.
+		// Bare skill:// URIs resolve to the skill directory here: the result must
+		// pass the isDirectory check below.
 		if (cwd?.includes("://") || cwd?.includes("local:/")) {
-			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true });
+			cwd = await expandInternalUrls(cwd, { ...internalUrlOptions, noEscape: true, skillUrlForDirectory: true });
 		}
 
 		// Best-effort cache invalidation: drop github-cache rows for any issue/PR
@@ -1490,11 +1566,12 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 				const out = normalizeResultOutput(result);
 				// The local executor already prepends `[Command cancelled]`; PTY
 				// output does not, so preserve one cancellation notice in either case.
-				const message = out.startsWith("[Command cancelled]")
+				let message = out.startsWith("[Command cancelled]")
 					? out
 					: out
 						? `${out}\n\n[Command aborted]`
 						: "Command aborted";
+				if (result.artifactError) message += `\n\n[${formatArtifactErrorNotice(result.artifactError)}]`;
 				if (signal?.aborted) {
 					throw new ToolAbortError(message);
 				}
@@ -1744,7 +1821,7 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 								)
 							: undefined;
 					let warningLine: string | undefined;
-					if (details?.meta?.truncation && !showingFullOutput) {
+					if (details?.meta?.artifactError || (details?.meta?.truncation && !showingFullOutput)) {
 						warningLine = formatStyledTruncationWarning(details.meta, uiTheme) ?? undefined;
 					}
 

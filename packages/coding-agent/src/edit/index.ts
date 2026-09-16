@@ -9,7 +9,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
-import type { ToolExample } from "@oh-my-pi/pi-ai";
+import type { Model, ToolExample } from "@oh-my-pi/pi-ai";
 import {
 	EditSession,
 	editDescription,
@@ -55,6 +55,7 @@ import { ToolError } from "../tools/tool-errors";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
 import { attemptEditAutoRepair, type EditAutoRepairOutcome } from "./auto-repair";
 import { type AppliedEditSnapshot, createEditBlackboxRecorder } from "./blackbox";
+import hashlineCompactPrompt from "./hashline-compact.md" with { type: "text" };
 import { type EditToolDetails, type EditToolPerFileResult, getLspBatchRequest, type Operation } from "./renderer";
 import {
 	type ApplyPatchParams,
@@ -128,6 +129,37 @@ function resolveConfiguredEditMode(rawEditMode: string): EditMode | undefined {
 	const editMode = normalizeEditMode(rawEditMode);
 	if (!editMode) throw new Error(`Invalid PI_EDIT_VARIANT: ${rawEditMode}`);
 	return editMode;
+}
+
+/**
+ * Compact tool description markdown for `mode`, when one exists. TS-side
+ * source (not the native addon) so PR CI — which tests against the latest
+ * *release* addons — exercises the same rendering production does.
+ */
+export function editDescriptionCompact(mode: EditMode): string | undefined {
+	switch (mode) {
+		case "hashline":
+			return hashlineCompactPrompt;
+		default:
+			return undefined;
+	}
+}
+
+/**
+ * Tool description for `mode`, at the density the model's catalog policy
+ * selects (`edit-prompt-variant`). Models without the compact variant — or
+ * modes that have none — keep the full prompt; both renderings preserve every
+ * operation and invariant.
+ */
+export function resolveEditToolDescription(
+	mode: EditMode,
+	model: Pick<Model, "editPromptVariant"> | undefined,
+): string {
+	const source =
+		model?.editPromptVariant === "compact"
+			? (editDescriptionCompact(mode) ?? editDescription(mode))
+			: editDescription(mode);
+	return prompt.render(source);
 }
 
 function resolveAllowFuzzy(session: ToolSession, rawValue: string): boolean {
@@ -308,6 +340,7 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #editMode?: EditMode;
 	readonly #deferredDiagnostics: DeferredDiagnostics;
 	readonly #sessions = new Map<string, EditSession>();
+	readonly #streamedArgs = new Map<string, string>();
 
 	constructor(
 		private readonly session: ToolSession,
@@ -334,7 +367,7 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get description(): string {
-		return prompt.render(editDescription(this.mode));
+		return resolveEditToolDescription(this.mode, this.session.getActiveModel?.());
 	}
 
 	get parameters(): TInput {
@@ -401,6 +434,7 @@ export class EditTool implements AgentTool<TInput> {
 	openArgStream(init: AgentToolArgStreamInit): AgentToolArgStream {
 		const existing = this.#sessions.get(init.toolCallId);
 		if (existing) existing.close();
+		this.#streamedArgs.delete(init.toolCallId);
 		// A call that arrived through the custom-tool wire streams the payload
 		// verbatim; JSON function calls stream JSON text.
 		const rawInput = init.customWireName !== undefined;
@@ -418,13 +452,18 @@ export class EditTool implements AgentTool<TInput> {
 			if (oldestId === undefined) break;
 			this.#sessions.get(oldestId)?.close();
 			this.#sessions.delete(oldestId);
+			this.#streamedArgs.delete(oldestId);
 		}
 		return {
 			push: delta => editSession.push(delta),
-			end: () => editSession.finish(),
+			end: args => {
+				editSession.finish();
+				this.#streamedArgs.set(init.toolCallId, JSON.stringify(args));
+			},
 			cancel: () => {
 				editSession.close();
 				if (this.#sessions.get(init.toolCallId) === editSession) this.#sessions.delete(init.toolCallId);
+				this.#streamedArgs.delete(init.toolCallId);
 			},
 		};
 	}
@@ -437,11 +476,19 @@ export class EditTool implements AgentTool<TInput> {
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<EditToolDetails, TInput>> {
 		let editSession = this.#sessions.get(toolCallId);
+		const argsJson = JSON.stringify(params);
+		if (editSession && this.#streamedArgs.get(toolCallId) !== argsJson) {
+			editSession.close();
+			this.#sessions.delete(toolCallId);
+			editSession = undefined;
+		}
+		this.#streamedArgs.delete(toolCallId);
 		if (!editSession) {
 			// No deltas were streamed (non-streaming provider, inline recovery,
-			// Cursor batch frames): the parsed args are the whole payload.
+			// Cursor batch frames), or a pre-execution hook revised the arguments:
+			// the parsed args are the whole effective payload.
 			editSession = new EditSession(getEditStore(this.session), this.#policy(false));
-			editSession.setArgsJson(JSON.stringify(params));
+			editSession.setArgsJson(argsJson);
 			editSession.finish();
 		}
 		const batch = getLspBatchRequest(context?.toolCall);
@@ -460,6 +507,7 @@ export class EditTool implements AgentTool<TInput> {
 		} finally {
 			editSession.close();
 			if (this.#sessions.get(toolCallId) === editSession) this.#sessions.delete(toolCallId);
+			this.#streamedArgs.delete(toolCallId);
 		}
 
 		if (outcome.isError) {
@@ -647,8 +695,8 @@ export class EditTool implements AgentTool<TInput> {
 		invalidateFsScanAfterWrite(request.path);
 		this.session.bumpFileMutationVersion?.(request.path);
 		return {
-			written: request.content,
-			diagnosticsJson: diagnostics ? JSON.stringify(diagnostics) : undefined,
+			written: diagnostics.finalContent,
+			diagnosticsJson: diagnostics.diagnostics ? JSON.stringify(diagnostics.diagnostics) : undefined,
 		};
 	}
 }

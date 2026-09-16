@@ -36,7 +36,6 @@ export const HINDSIGHT_DEFAULTS: HindsightConfig = {
 	retainTimeoutMs: 60_000,
 	mentalModelsEnabled: true,
 	mentalModelAutoSeed: true,
-	mentalModelRefreshIntervalMs: 5 * 60 * 1000,
 	mentalModelMaxRenderChars: 16_000,
 };
 
@@ -118,8 +117,6 @@ export function resolveHindsightConfig(
 			envInt(env.HINDSIGHT_RETAIN_TIMEOUT_MS) ?? input.retainTimeoutMs ?? HINDSIGHT_DEFAULTS.retainTimeoutMs,
 		mentalModelsEnabled: input.mentalModelsEnabled ?? HINDSIGHT_DEFAULTS.mentalModelsEnabled,
 		mentalModelAutoSeed: input.mentalModelAutoSeed ?? HINDSIGHT_DEFAULTS.mentalModelAutoSeed,
-		mentalModelRefreshIntervalMs:
-			input.mentalModelRefreshIntervalMs ?? HINDSIGHT_DEFAULTS.mentalModelRefreshIntervalMs,
 		mentalModelMaxRenderChars: input.mentalModelMaxRenderChars ?? HINDSIGHT_DEFAULTS.mentalModelMaxRenderChars,
 	};
 }

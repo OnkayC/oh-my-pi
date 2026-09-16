@@ -925,6 +925,38 @@ describe("Coding Agent Tools", () => {
 			expect(output).toContain(`${total} x`);
 		});
 
+		it("does not claim a partial scan count is the total for bounded reads", async () => {
+			const testFile = path.join(testDir, "bounded-large.txt");
+			const lines = Array.from({ length: 10_000 }, (_, i) => `${i + 1} ${"x".repeat(500)}`);
+			fs.writeFileSync(testFile, lines.join("\n"));
+			expect(fs.statSync(testFile).size).toBeGreaterThan(4 * 1024 * 1024);
+
+			const result = await readTool.execute("test-bounded-large", { path: `${testFile}:1-3` });
+			const output = getTextOutput(result);
+
+			expect(output).toContain("not scanned to EOF");
+			expect(output).toContain("Use :7 to continue");
+			expect(output).not.toMatch(/\[Showing lines 1-6 of \d+/);
+			expect(result.details?.meta?.truncation).toBeUndefined();
+			expect(result.details?.truncation).toBeUndefined();
+		});
+
+		it("does not claim a suppressed hashline preview was shown", async () => {
+			Bun.env.PI_EDIT_VARIANT = "hashline";
+			const testFile = path.join(testDir, "hashline-preview-large.txt");
+			const firstLine = "x".repeat(70_000);
+			const tail = Array.from({ length: 9_000 }, () => "y".repeat(500)).join("\n");
+			fs.writeFileSync(testFile, `${firstLine}\n${tail}`);
+			expect(fs.statSync(testFile).size).toBeGreaterThan(4 * 1024 * 1024);
+
+			const result = await readTool.execute("test-hashline-preview-large", { path: `${testFile}:1-1` });
+			const output = getTextOutput(result);
+
+			expect(output).toContain("Hashline output requires full lines");
+			expect(output).toContain("[File not scanned to EOF]");
+			expect(output).not.toContain("Showing line 1");
+		});
+
 		it("tail selector is verbatim under :raw and clamps to the whole file when N exceeds it", async () => {
 			const testFile = path.join(testDir, "tail-raw.txt");
 			fs.writeFileSync(testFile, "alpha\nbeta\ngamma\n");
@@ -967,8 +999,11 @@ describe("Coding Agent Tools", () => {
 			const result = await artifactReadTool.execute("test-call-artifact-byte-limit", {
 				path: "artifact://7:3-4",
 			});
-
-			expect(getTextOutput(result)).toContain("[Showing lines 2-2 of 4 (50.0KB limit). Use :3 to continue]");
+			const output = getTextOutput(result);
+			expect(output).toContain("[Showing lines 2-2 of 4 (50.0KB limit)]");
+			expect(output).toContain("Line 3 is 60.0KB");
+			expect(output).toContain("artifact://7:raw:3-3");
+			expect(output).not.toContain("Use :3 to continue");
 		});
 
 		it("should spill oversized read output to an artifact", async () => {

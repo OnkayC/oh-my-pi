@@ -59,7 +59,6 @@ export interface HindsightConfig {
 
 	mentalModelsEnabled: boolean;
 	mentalModelAutoSeed: boolean;
-	mentalModelRefreshIntervalMs: number;
 	mentalModelMaxRenderChars: number;
 }
 
@@ -102,7 +101,6 @@ export function loadHindsightConfig(settings: Settings, env: NodeJS.ProcessEnv =
 			retainTimeoutMs: settings.get("hindsight.retainTimeoutMs"),
 			mentalModelsEnabled: settings.get("hindsight.mentalModelsEnabled"),
 			mentalModelAutoSeed: settings.get("hindsight.mentalModelAutoSeed"),
-			mentalModelRefreshIntervalMs: settings.get("hindsight.mentalModelRefreshIntervalMs"),
 			mentalModelMaxRenderChars: settings.get("hindsight.mentalModelMaxRenderChars"),
 		},
 		env,
