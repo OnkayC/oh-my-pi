@@ -22,45 +22,33 @@ jobs:
          fail-fast: false
          matrix:
             include:
-               - {
-                    os: ubuntu-24.04,
-                    target_id: linux-x64,
-                    binary_path: packages/coding-agent/binaries/hindsight-agent-bridge-linux-x64,
-                 }
-               - {
-                    os: ubuntu-24.04-arm,
-                    target_id: linux-arm64,
-                    binary_path: packages/coding-agent/binaries/hindsight-agent-bridge-linux-arm64,
-                 }
-               - {
-                    os: macos-14,
-                    target_id: darwin-arm64,
-                    binary_path: packages/coding-agent/binaries/hindsight-agent-bridge-darwin-arm64,
-                 }
-               - {
-                    os: macos-15-intel,
-                    target_id: darwin-x64,
-                    binary_path: packages/coding-agent/binaries/hindsight-agent-bridge-darwin-x64,
-                 }
+               - { os: ubuntu-24.04, target_id: linux-x64 }
+               - { os: ubuntu-24.04-arm, target_id: linux-arm64 }
+               - { os: macos-14, target_id: darwin-arm64 }
+               - { os: macos-15-intel, target_id: darwin-x64 }
       runs-on: ${{ matrix.os }}
       env:
+         BRIDGE_BINARY: packages/coding-agent/binaries/hindsight-agent-bridge-${{ matrix.target_id }}
          MACOS_SIGNING: ${{ secrets.APPLE_CERTIFICATE_P12 != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_API_KEY_ID != '' && secrets.APPLE_API_ISSUER_ID != '' && secrets.APPLE_API_KEY != '' }}
       steps:
          - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
          - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+           id: bun
            with:
               bun-version: "1.4"
-         - name: Cache Bun dependencies
-           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-           with:
-              path: ~/.bun/install/cache
-              key: bun-${{ runner.os }}-${{ hashFiles('**/bun.lock') }}
-         - run: bun install --frozen-lockfile
          - name: Verify release tag matches bridge version
            shell: bash
            run: |
               version="$(bun -e 'console.log(require("./packages/coding-agent/package.json").version)')"
               test "${GITHUB_REF_NAME}" = "hindsight-agent-bridge-v${version}"
+         - name: Cache Bun dependencies
+           uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: ~/.bun/install/cache
+              key: hindsight-agent-bridge-bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.bun.outputs.bun-version }}-${{ hashFiles('bun.lock') }}
+              restore-keys: |
+                 hindsight-agent-bridge-bun-${{ runner.os }}-${{ runner.arch }}-${{ steps.bun.outputs.bun-version }}-
+         - run: bun install --frozen-lockfile --filter @oh-my-pi/pi-coding-agent --ignore-scripts
          - name: Build Hindsight agent bridge
            env:
               RELEASE_TARGETS: ${{ matrix.target_id }}
@@ -73,32 +61,26 @@ jobs:
               APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
               APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
               APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-           run: bash scripts/ci-macos-sign.sh "${{ matrix.binary_path }}"
-         - name: Smoke Hindsight agent bridge
+           shell: bash
+           run: bash scripts/ci-macos-sign.sh "$BRIDGE_BINARY" bash scripts/ci-smoke-hindsight-agent-bridge.sh "$BRIDGE_BINARY" "${GITHUB_REF_NAME#hindsight-agent-bridge-v}"
+         - name: Verify macOS bridge signature
+           if: startsWith(matrix.target_id, 'darwin-')
            shell: bash
            run: |
-              runtime_dir="$(mktemp -d)"
-              cat > "$runtime_dir/config.json" <<'EOF'
-              {
-                "apiToken": "offline-token",
-                "apiUrl": "http://127.0.0.1:9999",
-                "bankId": "coding-agents",
-                "mentalModelsEnabled": false,
-                "scoping": "per-project-tagged"
-              }
-              EOF
-              chmod 600 "$runtime_dir/config.json"
-              "${{ matrix.binary_path }}" --version
-              HINDSIGHT_BRIDGE_CONFIG="$runtime_dir/config.json" "${{ matrix.binary_path }}" diagnose --cwd "$GITHUB_WORKSPACE" --json
+              codesign -dvvv "$BRIDGE_BINARY"
+              codesign --verify --strict --verbose=4 "$BRIDGE_BINARY"
+         - name: Smoke Hindsight agent bridge
+           shell: bash
+           run: bash scripts/ci-smoke-hindsight-agent-bridge.sh "$BRIDGE_BINARY" "${GITHUB_REF_NAME#hindsight-agent-bridge-v}"
          - name: Generate bridge checksum sidecar
-           run: bun run ci:release:checksums "${{ matrix.binary_path }}.sha256" "${{ matrix.binary_path }}"
+           run: bun run ci:release:checksums "$BRIDGE_BINARY.sha256" "$BRIDGE_BINARY"
          - name: Upload Hindsight agent bridge artifact
            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
            with:
               name: hindsight-agent-bridge-${{ matrix.target_id }}
               path: |
-                 ${{ matrix.binary_path }}
-                 ${{ matrix.binary_path }}.sha256
+                 ${{ env.BRIDGE_BINARY }}
+                 ${{ env.BRIDGE_BINARY }}.sha256
               if-no-files-found: error
 
    publish:
@@ -152,28 +134,20 @@ jobs:
       env:
          BRIDGE_BINARY: hindsight-agent-bridge-${{ matrix.target_id }}
       steps:
+         - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+           with:
+              sparse-checkout: scripts/ci-smoke-hindsight-agent-bridge.sh
+              sparse-checkout-cone-mode: false
          - name: Download published bridge
            shell: bash
            run: |
-              curl -fsSL -o "hindsight-agent-bridge-${{ matrix.target_id }}" "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hindsight-agent-bridge-${{ matrix.target_id }}"
-              curl -fsSL -o "hindsight-agent-bridge-${{ matrix.target_id }}.sha256" "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/hindsight-agent-bridge-${{ matrix.target_id }}.sha256"
-              chmod +x "hindsight-agent-bridge-${{ matrix.target_id }}"
+              curl -fsSL -o "$BRIDGE_BINARY" "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$BRIDGE_BINARY"
+              curl -fsSL -o "$BRIDGE_BINARY.sha256" "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$BRIDGE_BINARY.sha256"
+              chmod +x "$BRIDGE_BINARY"
          - name: Verify published bridge
            shell: bash
            run: |
-              shasum -a 256 -c "hindsight-agent-bridge-${{ matrix.target_id }}.sha256"
-              codesign -dvvv "./hindsight-agent-bridge-${{ matrix.target_id }}"
-              codesign --verify --strict --verbose=4 "./hindsight-agent-bridge-${{ matrix.target_id }}"
-              runtime_dir="$(mktemp -d)"
-              cat > "$runtime_dir/config.json" <<'EOF'
-              {
-                "apiToken": "offline-token",
-                "apiUrl": "http://127.0.0.1:9999",
-                "bankId": "coding-agents",
-                "mentalModelsEnabled": false,
-                "scoping": "per-project-tagged"
-              }
-              EOF
-              chmod 600 "$runtime_dir/config.json"
-              "./hindsight-agent-bridge-${{ matrix.target_id }}" --version
-              HINDSIGHT_BRIDGE_CONFIG="$runtime_dir/config.json" "./hindsight-agent-bridge-${{ matrix.target_id }}" diagnose --cwd "$GITHUB_WORKSPACE" --json
+              shasum -a 256 -c "$BRIDGE_BINARY.sha256"
+              codesign -dvvv "./$BRIDGE_BINARY"
+              codesign --verify --strict --verbose=4 "./$BRIDGE_BINARY"
+              bash scripts/ci-smoke-hindsight-agent-bridge.sh "./$BRIDGE_BINARY" "${GITHUB_REF_NAME#hindsight-agent-bridge-v}"

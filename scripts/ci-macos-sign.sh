@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Sign and notarize a compiled macOS `omp` binary with a Developer ID identity.
+# Sign and notarize a compiled macOS binary with a Developer ID identity.
 #
 # The release build (`ci:release:build-binaries`) ad-hoc signs the binary so it
 # runs locally. This script *replaces* that signature with a real Developer ID
@@ -22,7 +22,12 @@
 #   APPLE_API_ISSUER_ID          App Store Connect API issuer id (UUID)
 #   APPLE_API_KEY                base64 of the App Store Connect .p8 private key
 #
-# Usage: scripts/ci-macos-sign.sh <path-to-binary>
+# Usage: bash scripts/ci-macos-sign.sh BINARY [SMOKE_COMMAND ARG...]
+# Always checks BINARY --version. By default, also runs BINARY --smoke-test.
+# An optional smoke command replaces --smoke-test and runs as exact argv in an
+# isolated HOME, for example:
+#   bash scripts/ci-macos-sign.sh "$binary" \
+#     bash scripts/ci-smoke-hindsight-agent-bridge.sh "$binary" "$version"
 
 set -euo pipefail
 
@@ -33,13 +38,14 @@ fi
 
 BINARY="${1:-}"
 if [[ -z "$BINARY" ]]; then
-	echo "usage: ci-macos-sign.sh <path-to-binary>" >&2
+	echo "usage: ci-macos-sign.sh BINARY [SMOKE_COMMAND ARG...]" >&2
 	exit 1
 fi
 if [[ ! -f "$BINARY" ]]; then
 	echo "ci-macos-sign: binary not found: $BINARY" >&2
 	exit 1
 fi
+shift
 
 missing=()
 for var in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY; do
@@ -114,7 +120,11 @@ codesign -dvvv "$BINARY" 2>&1 | grep -E "Authority|TeamIdentifier|flags=|Timesta
 echo "ci-macos-sign: launch check under the hardened-runtime signature"
 run_home="$WORKDIR/home"
 HOME="$run_home" XDG_DATA_HOME="$run_home/xdg" "$BINARY" --version
-HOME="$run_home" XDG_DATA_HOME="$run_home/xdg" "$BINARY" --smoke-test
+if (($#)); then
+	HOME="$run_home" XDG_DATA_HOME="$run_home/xdg" "$@"
+else
+	HOME="$run_home" XDG_DATA_HOME="$run_home/xdg" "$BINARY" --smoke-test
+fi
 
 echo "ci-macos-sign: submitting for notarization"
 /usr/bin/ditto -c -k --keepParent "$BINARY" "$ZIP_PATH"
