@@ -26,6 +26,11 @@ function loadLaunchHelp(): typeof LaunchHelp.launchHelp {
 
 export const commands: CommandEntry[] = [
 	{
+		name: "server",
+		load: () => import("./commands/server").then(m => m.default),
+		help: { description: "Run or connect to the opt-in shared session backend" },
+	},
+	{
 		name: "launch",
 		load: () => import("./commands/launch").then(m => m.default),
 		get help() {
