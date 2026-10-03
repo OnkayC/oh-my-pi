@@ -6,10 +6,10 @@ import type { HindsightApi, MemoryItemInput } from "./client";
 import type { HindsightConfig } from "./config";
 import {
 	composeRecallQuery,
-	formatCurrentTime,
 	formatMemories,
 	type HindsightMessage,
 	prepareRetentionTranscript,
+	retentionPrefixKey,
 	sliceLastTurnsByUserBoundary,
 	truncateRecallQuery,
 } from "./content";
@@ -191,17 +191,6 @@ export class HindsightRetainQueue {
 	}
 }
 
-/** Rolling hash of messages[0, count) for retention-cache validation (see #lastRetainedPrefixKey). */
-function retentionPrefixKey(messages: HindsightMessage[], count: number): string {
-	let key = "";
-	for (let i = 0; i < count; i++) {
-		const m = messages[i];
-		if (m === undefined) break;
-		key = Bun.hash(`${key}\u0000${m.role}\u0000${m.content}\u0000${m.timestamp ?? ""}`).toString(36);
-	}
-	return key;
-}
-
 /** Per-session Hindsight runtime state owned by its AgentSession. */
 export class HindsightSessionState {
 	/** Session id used for retain-queue metadata. */
@@ -244,12 +233,6 @@ export class HindsightSessionState {
 	mentalModelsLoadPromise?: Promise<void>;
 	#mentalModelsLoadGeneration = 0;
 	unsubscribe?: () => void;
-	/**
-	 * Releases the `onHindsightScopeChanged` subscription that drives live
-	 * rebuilds when `hindsight.bankId` / `bankIdPrefix` / `scoping` change.
-	 * Only set on primary states; aliases inherit the parent's subscription.
-	 */
-	unsubscribeScope?: () => void;
 	/** Alias states delegate persistence config to a primary parent state. */
 	aliasOf?: HindsightSessionState;
 	readonly retainQueue: HindsightRetainQueue;
@@ -308,12 +291,13 @@ export class HindsightSessionState {
 				types: this.config.recallTypes.length > 0 ? this.config.recallTypes : undefined,
 				tags: this.recallTags,
 				tagsMatch: this.recallTagsMatch,
+				signal,
 			});
 			if (signal?.aborted) return { context: null, ok: false };
 			const results = response.results ?? [];
 			if (results.length === 0) return { context: null, ok: true };
 			const formatted = formatMemories(results);
-			const block = `<memories>\n${this.config.recallPromptPreamble}\nCurrent time: ${formatCurrentTime()} UTC\n\n${formatted}\n</memories>`;
+			const block = `<memories>\n${this.config.recallPromptPreamble}\n\n${formatted}\n</memories>`;
 			return { context: block, ok: true };
 		} catch (err) {
 			if (this.config.debug) {
@@ -433,7 +417,10 @@ export class HindsightSessionState {
 		}
 	}
 
-	async beforeAgentStartPrompt(promptText: string): Promise<MemoryPromptPreparation | undefined> {
+	async beforeAgentStartPrompt(
+		promptText: string,
+		signal?: AbortSignal,
+	): Promise<MemoryPromptPreparation | undefined> {
 		if (this.config.mentalModelsEnabled && this.mentalModelsLoadPromise && this.mentalModelsLoadedAt === undefined) {
 			await Promise.race([this.mentalModelsLoadPromise, Bun.sleep(MENTAL_MODEL_FIRST_TURN_DEADLINE_MS)]);
 		}
@@ -448,7 +435,7 @@ export class HindsightSessionState {
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
-		const { context, ok } = await this.recallForContext(truncated);
+		const { context, ok } = await this.recallForContext(truncated, signal);
 		if (!ok) return undefined;
 
 		return {
@@ -605,8 +592,6 @@ export class HindsightSessionState {
 		this.#mentalModelsLoadGeneration++;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
-		this.unsubscribeScope?.();
-		this.unsubscribeScope = undefined;
 		this.retainQueue.dispose();
 	}
 

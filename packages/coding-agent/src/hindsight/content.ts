@@ -16,6 +16,17 @@ export interface HindsightMessage {
 	timestamp?: string;
 }
 
+/** Rolling hash of messages[0, count) for retention-cache and transcript-boundary validation. */
+export function retentionPrefixKey(messages: HindsightMessage[], count: number): string {
+	let key = "";
+	for (let i = 0; i < count; i++) {
+		const m = messages[i];
+		if (m === undefined) break;
+		key = Bun.hash(`${key}\u0000${m.role}\u0000${m.content}\u0000${m.timestamp ?? ""}`).toString(36);
+	}
+	return key;
+}
+
 export interface RecallResultLike {
 	text: string;
 	type?: string | null;
@@ -26,10 +37,11 @@ const MEMORIES_REGEX = /<memories>[\s\S]*?<\/memories>/g;
 const LEGACY_HINDSIGHT_MEMORIES_REGEX = /<hindsight_memories>[\s\S]*?<\/hindsight_memories>/g;
 const LEGACY_RELEVANT_MEMORIES_REGEX = /<relevant_memories>[\s\S]*?<\/relevant_memories>/g;
 const MENTAL_MODELS_REGEX = /<mental_models>[\s\S]*?<\/mental_models>/g;
+const BRIDGE_BINDING_REGEX = /<hindsight_bridge>[\s\S]*?<\/hindsight_bridge>/g;
 
 const RETENTION_PROTOCOL_MARKER_REGEX = /^\[(?:role:\s*[-_a-zA-Z0-9]+|[-_a-zA-Z0-9]+:end|timestamp:\s+.+)\]$/;
 /**
- * Strip `<memories>`, `<mental_models>`, and legacy memory blocks.
+ * Strip memory context, bridge bindings, and legacy memory blocks.
  *
  * Both `<memories>` (per-turn recall) and `<mental_models>` (curated semantic
  * memory) are injected into the system prompt. If either leaks into the
@@ -42,6 +54,7 @@ export function stripMemoryTags(content: string): string {
 	return content
 		.replace(MEMORIES_REGEX, "")
 		.replace(MENTAL_MODELS_REGEX, "")
+		.replace(BRIDGE_BINDING_REGEX, "")
 		.replace(LEGACY_HINDSIGHT_MEMORIES_REGEX, "")
 		.replace(LEGACY_RELEVANT_MEMORIES_REGEX, "");
 }

@@ -6,7 +6,7 @@ import {
 	createCompactionSummaryMessage,
 	defaultConvertToLlm,
 } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import type {
 	ResponseFileSearchToolCall,
 	ResponseFunctionWebSearch,
@@ -16,7 +16,6 @@ import type {
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import type { TUI } from "@oh-my-pi/pi-tui";
 import {
 	AdviseTool,
 	type AdvisorAgent,
@@ -27,6 +26,7 @@ import {
 	type AdvisorRuntimeHost,
 	advisorTranscriptFilename,
 	buildAdvisorQuarantineSourceText,
+	compareAdvisorNotes,
 	deriveAdvisorTelemetry,
 	formatAdvisorBatchContent,
 	formatAdvisorContextPrompt,
@@ -35,13 +35,9 @@ import {
 	isInterruptingSeverity,
 	quarantineAdvisorUnsafeOutput,
 	resolveAdvisorDeliveryChannel,
-	type WatchdogConfigDoc,
 } from "../../src/advisor";
-import type { ModelRegistry } from "../../src/config/model-registry";
-import type { Settings } from "../../src/config/settings";
-import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../../src/modes/components/advisor-config";
-import { createAdvisorMessageCard } from "../../src/modes/components/advisor-message";
-import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
+import { createAdvisorMessageCard } from "@oh-my-pi/pi-tui/chat/advisor-message";
+import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { obfuscateMessages } from "../../src/secrets/message-transform";
 import { SecretObfuscator } from "../../src/secrets/obfuscator";
 import { getOpenAiRemoteCompactionPayload } from "../../src/session/session-context";
@@ -69,6 +65,23 @@ function promptText(input: string | AgentMessage[]): string {
 			return String(m);
 		})
 		.join("\n");
+}
+
+/** High-entropy secret with no repeated 8-char window, so any surviving window is a leak. */
+function distinctSecret(length: number): string {
+	let secret = "";
+	for (let i = 0; secret.length < length; i++) secret += Bun.hash(`secret-${i}`).toString(36);
+	return secret.slice(0, length);
+}
+
+/** 8-char windows of `secret` present in `text`: a truncation cut leaks a secret as fragments, not whole. */
+function leakedSecretPieces(text: string, secret: string): string[] {
+	const pieces: string[] = [];
+	for (let i = 0; i + 8 <= secret.length; i++) {
+		const piece = secret.slice(i, i + 8);
+		if (text.includes(piece)) pieces.push(piece);
+	}
+	return pieces;
 }
 
 describe("advisor", () => {
@@ -682,7 +695,7 @@ describe("advisor", () => {
 			await tool.execute("tc-2", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith(note, "nit");
+			expect(onAdvice).toHaveBeenCalledWith(note, "nit", undefined);
 		});
 
 		it("allows the same advice after delivered-note memory resets", async () => {
@@ -695,8 +708,8 @@ describe("advisor", () => {
 			await tool.execute("tc-2", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(2);
-			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit");
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "nit");
+			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "nit", undefined);
 		});
 
 		it("forwards escalations of an already-delivered note and suppresses downgrades", async () => {
@@ -712,9 +725,9 @@ describe("advisor", () => {
 			await tool.execute("tc-5", { note, severity: "nit" });
 
 			expect(onAdvice).toHaveBeenCalledTimes(3);
-			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit");
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern");
-			expect(onAdvice).toHaveBeenNthCalledWith(3, note, "blocker");
+			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "nit", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(3, note, "blocker", undefined);
 		});
 
 		it("routes a same-text blocker escalation of an already-delivered note with the production guard", async () => {
@@ -759,7 +772,7 @@ describe("advisor", () => {
 
 			// Deferred notes are NOT delivered mid-turn; blocker still goes through.
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith("A destructive command is running.", "blocker");
+			expect(onAdvice).toHaveBeenCalledWith("A destructive command is running.", "blocker", undefined);
 			// The tool tells the advisor the note is deferred, not silently "Recorded.".
 			expect(JSON.stringify(deferred.content)).toContain("Queued for the end of the turn");
 
@@ -771,8 +784,8 @@ describe("advisor", () => {
 			// oldest first — no reliance on the advisor model re-raising them.
 			tool.beginUpdate(false);
 			expect(onAdvice).toHaveBeenCalledTimes(3);
-			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern");
-			expect(onAdvice).toHaveBeenNthCalledWith(3, "Minor naming cleanup.", "nit");
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "concern", undefined);
+			expect(onAdvice).toHaveBeenNthCalledWith(3, "Minor naming cleanup.", "nit", undefined);
 
 			// A later explicit re-raise of the same note is deduped (already delivered).
 			await tool.execute("tc-4", { note, severity: "concern" });
@@ -792,7 +805,7 @@ describe("advisor", () => {
 			tool.beginUpdate(false);
 			// Identical note queued once, flushed once.
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith(note, "concern");
+			expect(onAdvice).toHaveBeenCalledWith(note, "concern", undefined);
 		});
 
 		it("retains the highest severity when duplicate deferred advice escalates", async () => {
@@ -805,7 +818,7 @@ describe("advisor", () => {
 
 			tool.beginUpdate(false);
 			expect(onAdvice).toHaveBeenCalledTimes(1);
-			expect(onAdvice).toHaveBeenCalledWith("Same point raised repeatedly.", "concern");
+			expect(onAdvice).toHaveBeenCalledWith("Same point raised repeatedly.", "concern", undefined);
 		});
 
 		it("flushes one deferred concern per update past the per-update emission budget on a late catch-up", async () => {
@@ -1403,6 +1416,24 @@ describe("advisor", () => {
 			expect(content.split('advisor="').length - 1).toBe(1);
 			expect(content).toContain("default note");
 		});
+
+		it("orders merged notes newest-turn-first then severity, marking age", () => {
+			// Merged boundary batches surface the newest review first — it describes
+			// the current state of the work — with `turns_ago` marking how stale each
+			// older note is, so the primary can discount superseded ones.
+			const notes = [
+				{ note: "old blocker", severity: "blocker" as const, turn: 3 },
+				{ note: "new nit", severity: "nit" as const, turn: 5 },
+				{ note: "new blocker", severity: "blocker" as const, turn: 5 },
+			].sort(compareAdvisorNotes);
+			const content = formatAdvisorBatchContent(notes, { currentTurn: 6 });
+			expect(content.indexOf("new blocker")).toBeLessThan(content.indexOf("new nit"));
+			expect(content.indexOf("new nit")).toBeLessThan(content.indexOf("old blocker"));
+			expect(content).toContain('turns_ago="3"');
+			// Both current-turn-5 notes are one turn old at delivery turn 6.
+			expect(content.match(/turns_ago="1"/g)?.length).toBe(2);
+			expect(content.split("turns_ago=").length - 1).toBe(3);
+		});
 	});
 
 	describe("deriveAdvisorTelemetry", () => {
@@ -1592,6 +1623,84 @@ describe("advisor", () => {
 			releasePrompt.resolve();
 			await settleUntil(() => runtime.backlog === 0);
 		});
+		it("waits without a wall-clock deadline until abort releases strict catch-up", async () => {
+			const promptStarted = Promise.withResolvers<void>();
+			const releasePrompt = Promise.withResolvers<void>();
+			const messages: AgentMessage[] = [{ role: "user", content: "first", timestamp: 1 } as AgentMessage];
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					promptStarted.resolve();
+					await releasePrompt.promise;
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const runtime = new AdvisorRuntime(agent, {
+				snapshotMessages: () => messages,
+			});
+
+			runtime.onTurnEnd();
+			await promptStarted.promise;
+			const controller = new AbortController();
+			let settled = false;
+			vi.useFakeTimers();
+			try {
+				const catchup = runtime.waitForCatchup(undefined, 1, controller.signal).then(caughtUp => {
+					settled = true;
+					return caughtUp;
+				});
+				vi.advanceTimersByTime(60_000);
+				await Promise.resolve();
+				expect(settled).toBe(false);
+
+				controller.abort();
+				expect(await catchup).toBe(false);
+			} finally {
+				releasePrompt.resolve();
+				vi.useRealTimers();
+			}
+			await settleUntil(() => runtime.backlog === 0);
+		});
+
+		it("reviews a cadence-held tool result as the primary saw it after an in-place prune", async () => {
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const agent = makeAgent(promptInputs);
+			const readResult = {
+				role: "toolResult",
+				toolCallId: "read-1",
+				toolName: "read",
+				content: [{ type: "text", text: "export const retries = 3;" }],
+				isError: false,
+				timestamp: 2,
+			} as unknown as ToolResultMessage;
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "inspect the retry config", timestamp: 1 } as AgentMessage,
+				readResult as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, { snapshotMessages: () => messages });
+
+			runtime.onTurnEnd(messages, { willContinue: true, dispatch: false });
+			await Promise.resolve();
+			expect(promptInputs).toHaveLength(0);
+
+			// The primary's per-turn prune blanks the superseded result in place and
+			// realigns delivered prefixes before the scheduled review renders.
+			readResult.content = [{ type: "text", text: "[superseded by a newer read]" }];
+			readResult.prunedAt = Date.now();
+			runtime.rebaseDeliveredPrefix("prune-stale-tool-results");
+			messages.push({ role: "user", content: "now raise the limit", timestamp: 3 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await runtime.waitForCatchup(1_000, 1);
+
+			expect(promptInputs).toHaveLength(1);
+			const review = promptText(promptInputs[0]);
+			expect(review).toContain("export const retries = 3;");
+			expect(review).not.toContain("superseded by a newer read");
+			expect(review).toContain("inspect the retry config");
+			expect(review).toContain("now raise the limit");
+		});
+
 		it("preserves the next user turn when an accepted empty stop is pruned", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
@@ -2279,6 +2388,40 @@ describe("advisor", () => {
 			expect(rendered).toContain(placeholder);
 			expect(rendered).not.toContain("BEGIN_SECRET_");
 			expect(rendered).not.toContain("_END_SECRET");
+		});
+
+		it("redacts an expanded edit diff before middle truncation", async () => {
+			// One giant diff line; the secret straddles the tail window's cut, so
+			// truncating first would leave its suffix, which no redaction pass can match.
+			const secret = distinctSecret(2_000);
+			const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+			const diff = `--- a/big.ts\n+++ b/big.ts\n@@ -1 +1 @@\n+${".".repeat(10_000)}${secret}${".".repeat(3_000)}`;
+			const promptInputs: Array<string | AgentMessage[]> = [];
+			const agent = makeAgent(promptInputs);
+			const messages: AgentMessage[] = [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "c1", name: "edit", arguments: { path: "big.ts" } }],
+					timestamp: 1,
+				} as unknown as AgentMessage,
+				{
+					role: "toolResult",
+					toolCallId: "c1",
+					toolName: "edit",
+					content: "ok",
+					details: { diff },
+					isError: false,
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const runtime = new AdvisorRuntime(agent, { snapshotMessages: () => messages, obfuscator });
+
+			runtime.onTurnEnd();
+			await runtime.waitForCatchup(1_000, 1);
+
+			const rendered = promptText(promptInputs[0]);
+			expect(rendered).toContain("elided");
+			expect(leakedSecretPieces(rendered, secret)).toEqual([]);
 		});
 		it("does not scan tool-call arguments hidden by the primary-argument preview", async () => {
 			const obfuscator = new SecretObfuscator([
@@ -4019,30 +4162,6 @@ describe("advisor", () => {
 			expect(runtime.backlog).toBe(0);
 		});
 
-		it("drops backlog after 3 consecutive failures to prevent permanent stall", async () => {
-			const promptInputs: Array<string | AgentMessage[]> = [];
-			const agent: AdvisorAgent = {
-				prompt: async input => {
-					promptInputs.push(input);
-					throw new Error("fail");
-				},
-				abort: () => {},
-				reset: () => {},
-				state: { messages: [] },
-			};
-			const messages: AgentMessage[] = [{ role: "user", content: "aaa", timestamp: 1 } as AgentMessage];
-			const host: AdvisorRuntimeHost = {
-				snapshotMessages: () => messages,
-			};
-			const runtime = new AdvisorRuntime(agent, host, 0);
-
-			runtime.onTurnEnd(messages);
-			await settleUntil(() => promptInputs.length === 3 && runtime.backlog === 0);
-
-			expect(promptInputs).toHaveLength(3);
-			expect(runtime.backlog).toBe(0);
-		});
-
 		it("notifies the host once when consecutive prompt failures make the advisor unavailable", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const failures: unknown[] = [];
@@ -4219,6 +4338,82 @@ describe("advisor", () => {
 			const again = performance.now();
 			await runtime.waitForCatchup(60_000, 1);
 			expect(performance.now() - again).toBeLessThan(100);
+			runtime.dispose();
+		}, 10_000);
+
+		it("holds a recovery-aware catch-up through the failure but releases it on a terminal quota pause", async () => {
+			// Headless shutdown drains wait through a failing turn so disposal cannot
+			// abort the host's fallback switch. A recovery that ends in a quota pause
+			// can never drain, so the waiter must be released then — not held to its
+			// (ten-minute, in print mode) deadline.
+			const agent: AdvisorAgent = {
+				prompt: async () => {
+					throw new Error("insufficient_quota: you have exceeded your rate limit");
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "quota-turn", timestamp: 1 } as AgentMessage];
+			const recoveryStarted = Promise.withResolvers<void>();
+			const recoveryResult = Promise.withResolvers<boolean>();
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				onTurnError: () => {
+					recoveryStarted.resolve();
+					return recoveryResult.promise;
+				},
+				notifyQuotaExhausted: () => {},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			let settled = false;
+			const catchup = runtime.waitForCatchup(60_000, 1, undefined, { waitThroughRecovery: true }).then(caughtUp => {
+				settled = true;
+				return caughtUp;
+			});
+			// A failure-released waiter settles before onTurnError runs, so its
+			// continuation is already queued ahead of this one.
+			await recoveryStarted.promise;
+			expect(settled).toBe(false);
+
+			// No fallback available: the runtime latches its quota pause.
+			const released = performance.now();
+			recoveryResult.resolve(false);
+			expect(await catchup).toBe(false);
+			expect(performance.now() - released).toBeLessThan(2_000);
+			expect(runtime.quotaExhausted).toBe(true);
+			runtime.dispose();
+		}, 10_000);
+
+		it("releases a recovery-aware catch-up created while a session transition is paused", async () => {
+			// A paused runtime cannot drain until the transition resumes, which never
+			// happens on a shutdown path. A drain waiter created after the pause must
+			// release at once instead of parking for its (ten-minute) budget.
+			let abortPrompt: ((reason: unknown) => void) | undefined;
+			const agent: AdvisorAgent = {
+				prompt: () => {
+					const { promise, reject } = Promise.withResolvers<void>();
+					abortPrompt = reject;
+					return promise;
+				},
+				abort: reason => abortPrompt?.(new Error(String(reason))),
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [{ role: "user", content: "paused-turn", timestamp: 1 } as AgentMessage];
+			const host: AdvisorRuntimeHost = { snapshotMessages: () => messages };
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await settleUntil(() => abortPrompt !== undefined);
+			await runtime.pauseForSessionTransition();
+			expect(runtime.backlog).toBeGreaterThan(0);
+
+			const started = performance.now();
+			expect(await runtime.waitForCatchup(60_000, 1, undefined, { waitThroughRecovery: true })).toBe(false);
+			expect(performance.now() - started).toBeLessThan(100);
 			runtime.dispose();
 		}, 10_000);
 
@@ -6465,6 +6660,57 @@ describe("advisor", () => {
 			).toBe("steer");
 		});
 
+		it("opts a late concern into steering with allowTerminalConcernSteering, without bypassing other guards", () => {
+			// Final-review continuation policy: a concern against a terminal answer
+			// MAY steer one continuation when the caller opts in — but stop/abort
+			// suppression, preserveOnly, and the immune-turn cooldown still win.
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "concern",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					terminalAnswerNoQueuedWork: true,
+					allowTerminalConcernSteering: true,
+				}),
+			).toBe("steer");
+			// Stop/abort suppression is not bypassed.
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "concern",
+					autoResumeSuppressed: true,
+					streaming: false,
+					aborting: false,
+					terminalAnswerNoQueuedWork: true,
+					allowTerminalConcernSteering: true,
+				}),
+			).toBe("preserve");
+			// preserveOnly (headless/terminal-yield drain) is not bypassed.
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "concern",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					terminalAnswerNoQueuedWork: true,
+					allowTerminalConcernSteering: true,
+					preserveOnly: true,
+				}),
+			).toBe("preserve");
+			// The immune-turn cooldown is not bypassed.
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "concern",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					terminalAnswerNoQueuedWork: true,
+					interruptImmuneTurnActive: true,
+					allowTerminalConcernSteering: true,
+				}),
+			).toBe("aside");
+		});
+
 		it("downgrades concern to aside during immune turns, but still steers a blocker (#5628)", () => {
 			expect(
 				resolveAdvisorDeliveryChannel({
@@ -6545,110 +6791,6 @@ describe("advisor", () => {
 			expect(isAdvisorTranscriptName("__advisor-2.jsonl")).toBe(false);
 			expect(isAdvisorTranscriptName("Foo.jsonl")).toBe(false);
 			expect(isAdvisorTranscriptName("__advisor.arch.bak")).toBe(false);
-		});
-	});
-
-	describe("AdvisorConfigOverlayComponent", () => {
-		const deps = {
-			modelRegistry: {} as unknown as ModelRegistry,
-			settings: {} as unknown as Settings,
-			scopedModels: [],
-			availableToolNames: ["read", "grep", "glob", "lsp", "web_search"],
-		};
-		const callbacks = {
-			loadDoc: async () => ({ advisors: [] }),
-			save: async () => {},
-			close: () => {},
-			requestRender: () => {},
-			notify: () => {},
-		};
-		const strip = (lines: readonly string[]): string => lines.join("\n").replace(/\x1b\[[0-9;]*m/g, "");
-		const make = (doc: WatchdogConfigDoc, extra?: Partial<AdvisorConfigDeps>): AdvisorConfigOverlayComponent =>
-			new AdvisorConfigOverlayComponent({} as unknown as TUI, { ...deps, ...extra }, "project", doc, callbacks);
-		const fullHeight = Math.max(14, process.stdout.rows || 40);
-
-		it("paints a full-screen split frame: roster sidebar + selected-advisor preview", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				instructions: "shared baseline",
-				advisors: [
-					{ name: "Architecture", model: "x-ai/grok-code-fast:high" },
-					{ name: "Security", tools: ["read", "web_search"] },
-				],
-			});
-			const frame = overlay.render(200);
-			// Fills the screen top-to-bottom (the fix for the bottom-anchored frame
-			// whose offset broke mouse hit-testing and wasted the upper space).
-			expect(frame.length).toBe(fullHeight);
-			const text = strip(frame);
-			expect(text).toContain("Advisor configuration");
-			expect(text).toContain("project");
-			expect(text).toContain("Architecture");
-			expect(text).toContain("Security");
-			expect(text).toContain("+ Add advisor");
-			expect(text).toContain("Save & apply");
-			// Right preview reflects the highlighted (first) advisor.
-			expect(text).toContain("x-ai/grok-code-fast:high");
-			expect(text).toContain("read, grep, glob (default)");
-		});
-
-		it("renders an explicit no-tools advisor distinctly from the omitted default", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				advisors: [{ name: "Blank", tools: [] }],
-			});
-
-			const text = strip(overlay.render(200));
-			expect(text.toLowerCase()).toContain("no tools");
-			expect(text).not.toContain("read, grep, glob (default)");
-		});
-
-		it("moves the preview with keyboard selection and preserves an explicit tool set", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				advisors: [{ name: "Architecture" }, { name: "Security", tools: ["read", "web_search"] }],
-			});
-			overlay.render(200);
-			overlay.handleInput("\x1b[B"); // arrow down → highlight Security
-			expect(strip(overlay.render(200))).toContain("read, web_search");
-		});
-
-		it("opens an advisor's detail editor on a left click in the sidebar", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({ advisors: [{ name: "Architecture" }, { name: "Security" }] });
-			// Render once so the frame geometry is recorded; the first advisor sits on
-			// the first body row (0-based screen row 1 → SGR 1-based row 2).
-			overlay.render(120);
-			overlay.handleInput("\x1b[<0;4;2M"); // left-button press, col 4, row 2
-			const text = strip(overlay.render(120));
-			expect(text).toContain("Editing");
-			expect(text).toContain("Architecture");
-		});
-
-		it("shows disabled advisors with a dim circle marker and toggles them in the detail editor", async () => {
-			const uiTheme = await getThemeByName("dark");
-			if (!uiTheme) throw new Error("theme unavailable");
-			setThemeInstance(uiTheme);
-			const overlay = make({
-				advisors: [
-					{ name: "Active", model: "x-ai/grok-code-fast:high" },
-					{ name: "Disabled", model: "openai/gpt-4", enabled: false },
-				],
-			});
-			const text = strip(overlay.render(200));
-			// The list shows ● for enabled and ○ for disabled.
-			expect(text).toContain("● Active");
-			expect(text).toContain("○ Disabled");
-			// The preview of the highlighted (first) advisor shows its enabled status.
-			expect(text).toContain("● on");
 		});
 	});
 });

@@ -77,17 +77,24 @@ export function loadBridgeConfig(env: NodeJS.ProcessEnv = process.env): BridgeCo
 		throw new Error("Bridge config key 'mentalModelsEnabled' must be a boolean.");
 	}
 
+	const rawRetainEveryNTurns = env.HINDSIGHT_RETAIN_EVERY_N_TURNS?.trim();
+	let retainEveryNTurns: number | undefined;
+	if (rawRetainEveryNTurns !== undefined) {
+		retainEveryNTurns = Number(rawRetainEveryNTurns);
+		if (!/^\d+$/.test(rawRetainEveryNTurns) || !Number.isSafeInteger(retainEveryNTurns) || retainEveryNTurns < 1) {
+			throw new Error("HINDSIGHT_RETAIN_EVERY_N_TURNS must be a positive safe integer.");
+		}
+	}
+
 	const mentalModelsEnabled = record.mentalModelsEnabled;
-	const hindsight = resolveHindsightConfig(
-		{
-			hindsightApiUrl: apiUrl,
-			hindsightApiToken: apiToken,
-			bankId,
-			scoping: scoping as HindsightScoping,
-			mentalModelsEnabled,
-		},
-		{},
-	);
+	const hindsight = resolveHindsightConfig({
+		hindsightApiUrl: apiUrl,
+		hindsightApiToken: apiToken,
+		bankId,
+		scoping: scoping as HindsightScoping,
+		mentalModelsEnabled,
+		retainEveryNTurns,
+	});
 	return {
 		configPath,
 		configMode,

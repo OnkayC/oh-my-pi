@@ -51,14 +51,24 @@ describe("stripMemoryTags", () => {
 		expect(stripMemoryTags("plain content")).toBe("plain content");
 	});
 
-	it("strips <mental_models> blocks so curated context cannot leak back into retention", () => {
-		const text = ["alpha", "<mental_models>", "# User Preferences", "prefers tabs", "</mental_models>", "beta"].join(
-			"\n",
-		);
+	it("strips mental models and session bindings so injected context cannot leak into retention", () => {
+		const text = [
+			"alpha",
+			"<mental_models>",
+			"# User Preferences",
+			"prefers tabs",
+			"</mental_models>",
+			"<hindsight_bridge>",
+			'{"session_id":"other-session","cwd":"/private/project"}',
+			"</hindsight_bridge>",
+			"beta",
+		].join("\n");
 		const stripped = stripMemoryTags(text);
 		expect(stripped).not.toContain("<mental_models>");
 		expect(stripped).not.toContain("</mental_models>");
 		expect(stripped).not.toContain("# User Preferences");
+		expect(stripped).not.toContain("other-session");
+		expect(stripped).not.toContain("/private/project");
 		expect(stripped).toContain("alpha");
 		expect(stripped).toContain("beta");
 	});

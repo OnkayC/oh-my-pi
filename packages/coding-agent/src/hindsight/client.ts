@@ -443,12 +443,25 @@ export class HindsightApi {
 	 * inventory and `detail=full` only for debug surfaces.
 	 */
 	async listMentalModels(bankId: string, options?: ListMentalModelsOptions): Promise<MentalModelListResponse> {
-		return this.#request<MentalModelListResponse>(
-			"GET",
-			`/v1/default/banks/${encodeURIComponent(bankId)}/mental-models`,
-			"listMentalModels",
-			{ query: { detail: options?.detail ?? "content" }, signal: options?.signal },
-		);
+		const items: MentalModelSummary[] = [];
+		const limit = 100;
+		let offset = 0;
+		while (true) {
+			const page = await this.#request<MentalModelListResponse>(
+				"GET",
+				`/v1/default/banks/${encodeURIComponent(bankId)}/mental-models`,
+				"listMentalModels",
+				{ query: { detail: options?.detail ?? "content", limit, offset }, signal: options?.signal },
+			);
+			items.push(...page.items);
+			offset += page.items.length;
+			if (
+				page.items.length === 0 ||
+				(typeof page.total === "number" ? offset >= page.total : page.items.length < limit)
+			) {
+				return { items };
+			}
+		}
 	}
 
 	/** Fetch a single mental model. Returns `null` on 404. */

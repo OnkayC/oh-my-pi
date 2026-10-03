@@ -77,3 +77,44 @@ describe("HindsightApi timestamp serialization", () => {
 		});
 	});
 });
+
+describe("HindsightApi mental-model pagination", () => {
+	it("returns project models after a server-capped page", async () => {
+		const models = [
+			{ id: "global", bank_id: "shared", name: "Global", tags: [], content: "Global preference" },
+			{ id: "other", bank_id: "shared", name: "Other", tags: ["project:other"], content: "Other project" },
+			{ id: "current", bank_id: "shared", name: "Current", tags: ["project:current"], content: "Current decision" },
+		];
+		const server = Bun.serve({
+			port: 0,
+			fetch(request) {
+				const offset = Number(new URL(request.url).searchParams.get("offset") ?? 0);
+				return Response.json({ items: models.slice(offset, offset + 2), total: 3, limit: 2, offset });
+			},
+		});
+		try {
+			const client = new HindsightApi({ baseUrl: server.url.href });
+			expect((await client.listMentalModels("shared")).items).toEqual(models);
+		} finally {
+			server.stop(true);
+		}
+	});
+
+	it("rejects a failed later page instead of publishing a partial inventory", async () => {
+		const server = Bun.serve({
+			port: 0,
+			fetch(request) {
+				const offset = Number(new URL(request.url).searchParams.get("offset") ?? 0);
+				return offset === 0
+					? Response.json({ items: [{ id: "first", bank_id: "shared", name: "First" }], total: 2 })
+					: new Response("unavailable", { status: 503 });
+			},
+		});
+		try {
+			const client = new HindsightApi({ baseUrl: server.url.href });
+			await expect(client.listMentalModels("shared")).rejects.toThrow("unavailable");
+		} finally {
+			server.stop(true);
+		}
+	});
+});

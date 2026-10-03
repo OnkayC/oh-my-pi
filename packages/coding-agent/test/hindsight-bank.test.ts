@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, type 
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { computeBankScope, deriveBankId, ensureBankExists } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
+import { computeBankScope, ensureBankExists } from "@oh-my-pi/pi-coding-agent/hindsight/bank";
 import { HindsightApi } from "@oh-my-pi/pi-coding-agent/hindsight/client";
 import type { HindsightConfig } from "@oh-my-pi/pi-coding-agent/hindsight/config";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -123,12 +123,6 @@ describe("computeBankScope", () => {
 			);
 			expect(scope.bankId).toBe("prod-team-cool-app");
 		});
-
-		it("does not surface tag fields (isolation is at the bank level)", () => {
-			const scope = computeBankScope(baseConfig({ scoping: "per-project" }), "/work/proj");
-			expect(scope.retainTags).toBeUndefined();
-			expect(scope.recallTags).toBeUndefined();
-		});
 	});
 
 	describe("scoping=per-project-tagged", () => {
@@ -140,12 +134,6 @@ describe("computeBankScope", () => {
 				recallTagsMatch: "any",
 				observationScopes: [["project:proj"]],
 			});
-		});
-
-		it("uses the same project label for retain and recall tags", () => {
-			const scope = computeBankScope(baseConfig({ scoping: "per-project-tagged" }), "/repo/cool-app");
-			expect(scope.retainTags).toEqual(["project:cool-app"]);
-			expect(scope.recallTags).toEqual(["project:cool-app"]);
 		});
 
 		it("falls back to project:unknown when cwd is empty", () => {
@@ -163,7 +151,7 @@ describe("computeBankScope", () => {
 
 	// Regression for #2232: linked git worktrees used to silo memory into
 	// distinct `project:<basename>` tags. The fix resolves the primary
-	// checkout root via `git.repo.primaryRootSync`, so every worktree of one
+	// checkout root from Git metadata, so every worktree of one
 	// repo collapses to the same tag (and the same per-project bank id).
 	describe("git worktree handling", () => {
 		let baseDir: string;
@@ -270,14 +258,6 @@ describe("computeBankScope", () => {
 				"project:casedrepo",
 			]);
 		});
-	});
-});
-
-describe("deriveBankId (legacy wrapper)", () => {
-	it("returns the bankId field of the resolved scope", () => {
-		expect(deriveBankId(baseConfig({ bankId: "team", bankIdPrefix: "prod" }), "/cwd")).toBe("prod-team");
-		expect(deriveBankId(baseConfig({ scoping: "per-project" }), "/work/proj")).toBe("omp-proj");
-		expect(deriveBankId(baseConfig({ scoping: "per-project-tagged" }), "/work/proj")).toBe("omp");
 	});
 });
 

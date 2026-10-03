@@ -53,33 +53,14 @@ function codexEntry(value: unknown): HindsightMessage[] {
 	const payload = record(envelope.payload) ?? envelope;
 	const at = timestamp(envelope.timestamp ?? payload.timestamp);
 	if (payload.type === "message") {
-		const role = typeof payload.role === "string" ? payload.role : "assistant";
+		const role = payload.role;
+		if (role !== "user" && role !== "assistant") return [];
 		const content = textContent(payload.content);
 		if (syntheticCodexMessage(content)) return [];
 		const message = normalizedMessage(role, content, at);
 		return message ? [message] : [];
 	}
-	if (payload.type === "function_call" || payload.type === "custom_tool_call") {
-		const name = typeof payload.name === "string" ? payload.name : "tool";
-		const argumentsText = textContent(payload.arguments ?? payload.input);
-		const message = normalizedMessage("action", `${name}${argumentsText ? ` ${argumentsText}` : ""}`, at);
-		return message ? [message] : [];
-	}
 	return [];
-}
-
-function grokToolMessages(message: Record<string, unknown>, at?: string): HindsightMessage[] {
-	if (!Array.isArray(message.tool_calls)) return [];
-	const actions: HindsightMessage[] = [];
-	for (const rawCall of message.tool_calls) {
-		const call = record(rawCall);
-		const fn = record(call?.function);
-		const name = typeof fn?.name === "string" ? fn.name : typeof call?.name === "string" ? call.name : "tool";
-		const argumentsText = textContent(fn?.arguments ?? call?.arguments ?? call?.input);
-		const action = normalizedMessage("action", `${name}${argumentsText ? ` ${argumentsText}` : ""}`, at);
-		if (action) actions.push(action);
-	}
-	return actions;
 }
 
 function grokEntry(value: unknown): HindsightMessage[] {
@@ -95,7 +76,6 @@ function grokEntry(value: unknown): HindsightMessage[] {
 	const output: HindsightMessage[] = [];
 	const content = normalizedMessage(role, textContent(message.content), at);
 	if (content) output.push(content);
-	output.push(...grokToolMessages(message, at));
 	return output;
 }
 

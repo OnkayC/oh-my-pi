@@ -49,7 +49,7 @@ function childEnv(overrides: Record<string, string>): Record<string, string> {
 async function runHook(
 	binary: string,
 	harness: "codex" | "grok",
-	event: "session-start" | "stop",
+	event: "session-start" | "stop" | "session-end",
 	input: Record<string, unknown>,
 	env: Record<string, string>,
 ): Promise<void> {
@@ -108,8 +108,17 @@ async function main(): Promise<void> {
 	const globalDocumentId = `${prefix}:global`;
 	const codexSessionId = `${prefix}:codex`;
 	const grokSessionId = `${prefix}:grok`;
-	const ownedDocumentIds = [projectDocumentId, globalDocumentId, codexSessionId, grokSessionId];
-	if (ownedDocumentIds.some(documentId => !documentId.startsWith("bridge-smoke:"))) {
+	const codexDocumentId = `bridge:codex:${encodeURIComponent(codexSessionId)}:0`;
+	const grokDocumentId = `bridge:grok:${encodeURIComponent(grokSessionId)}:0`;
+	const ownedDocumentIds = [projectDocumentId, globalDocumentId, codexDocumentId, grokDocumentId];
+	if (
+		ownedDocumentIds.some(
+			documentId =>
+				!documentId.startsWith(`${prefix}:`) &&
+				!documentId.startsWith(`bridge:codex:${encodeURIComponent(codexSessionId)}:`) &&
+				!documentId.startsWith(`bridge:grok:${encodeURIComponent(grokSessionId)}:`),
+		)
+	) {
 		throw new Error("Refusing to run with unsafe cleanup document ids.");
 	}
 	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "hindsight-agent-bridge-smoke-"));
@@ -182,6 +191,14 @@ async function main(): Promise<void> {
 			);
 		});
 
+		await runHook(
+			options.binary,
+			"codex",
+			"session-start",
+			{ session_id: codexSessionId, cwd: options.project },
+			env,
+		);
+
 		const mcpClient = new Client({ name: "hindsight-bridge-smoke", version: "1" });
 		const transport = new StdioClientTransport({
 			command: options.binary,
@@ -203,7 +220,10 @@ async function main(): Promise<void> {
 			}
 			const result = await mcpClient.callTool({
 				name: "recall",
-				arguments: { query: `What is the shared global bridge smoke identifier ${globalToken}?` },
+				arguments: {
+					query: `What is the shared global bridge smoke identifier ${globalToken}?`,
+					scope: { session_id: codexSessionId, cwd: project.cwd },
+				},
 			});
 			if (!JSON.stringify(result.content).includes(prefix))
 				throw new Error("Compiled MCP recall missed global smoke memory.");
@@ -227,7 +247,7 @@ async function main(): Promise<void> {
 			await runHook(
 				options.binary,
 				"codex",
-				"stop",
+				"session-end",
 				{ session_id: codexSessionId, cwd: options.project, transcript_path: codexTranscript },
 				env,
 			);
@@ -241,12 +261,12 @@ async function main(): Promise<void> {
 		);
 		await runHook(options.binary, "grok", "session-start", { sessionId: grokSessionId, cwd: options.project }, env);
 		for (let attempt = 0; attempt < 2; attempt += 1) {
-			await runHook(options.binary, "grok", "stop", { sessionId: grokSessionId, cwd: options.project }, env);
+			await runHook(options.binary, "grok", "session-end", { sessionId: grokSessionId, cwd: options.project }, env);
 		}
 		await waitFor("hook session documents", async () => {
 			const [codexDocument, grokDocument] = await Promise.all([
-				project.client.getDocument(project.scope.bankId, codexSessionId),
-				project.client.getDocument(project.scope.bankId, grokSessionId),
+				project.client.getDocument(project.scope.bankId, codexDocumentId),
+				project.client.getDocument(project.scope.bankId, grokDocumentId),
 			]);
 			const projectTag = project.scope.retainTags?.[0];
 			if (!projectTag) return false;

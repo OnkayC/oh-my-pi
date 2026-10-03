@@ -10,7 +10,7 @@ import skillText from "./SKILL.md" with { type: "text" };
 
 const VERSION = packageJson.version;
 const HARNESSES: readonly BridgeHarness[] = ["amp", "codex", "grok"];
-const HOOK_EVENTS: readonly HookEvent[] = ["session-start", "user-prompt-submit", "stop"];
+const HOOK_EVENTS: readonly HookEvent[] = ["session-start", "user-prompt-submit", "stop", "session-end"];
 
 function requiredChoice<T extends string>(value: string | undefined, choices: readonly T[], label: string): T {
 	if (!value || !choices.includes(value as T)) throw new Error(`${label} must be one of: ${choices.join(", ")}.`);
@@ -96,8 +96,7 @@ async function hook(args: string[]): Promise<void> {
 
 async function mcp(): Promise<void> {
 	const harness = requiredChoice(process.env.HINDSIGHT_HARNESS, HARNESSES, "HINDSIGHT_HARNESS");
-	const runtime = await createBridgeRuntime(loadBridgeConfig(), process.cwd());
-	await runMcpServer(runtime, harness);
+	await runMcpServer(loadBridgeConfig(), harness);
 }
 
 export async function runBridgeCli(args: string[] = process.argv.slice(2)): Promise<number> {
@@ -123,7 +122,7 @@ export async function runBridgeCli(args: string[] = process.argv.slice(2)): Prom
 				return 0;
 			default:
 				throw new Error(
-					"Usage: hindsight-agent-bridge --version | diagnose [--cwd PATH] [--online] --json | mcp | hook <amp|codex|grok> <session-start|user-prompt-submit|stop> | skill",
+					"Usage: hindsight-agent-bridge --version | diagnose [--cwd PATH] [--online] --json | mcp | hook <amp|codex|grok> <session-start|user-prompt-submit|stop|session-end> | skill",
 				);
 		}
 	} catch (error) {

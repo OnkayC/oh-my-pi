@@ -24,6 +24,7 @@ import {
 import { acquireTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Browser, HTTPRequest, Page, Target } from "puppeteer-core";
+import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -426,9 +427,11 @@ describe("pickElectronTarget", () => {
 			const targetPage = (await launched.browser.pages())[0];
 			if (!targetPage) throw new Error("Expected the launched browser to expose a page target");
 
+			// Count navigations only: after the abort Chrome renders its error page,
+			// whose inline data: icons also surface as intercepted requests.
 			let requestCount = 0;
 			const onRequest = (request: HTTPRequest) => {
-				requestCount++;
+				if (request.isNavigationRequest()) requestCount++;
 				void request.abort("failed");
 			};
 			await targetPage.setRequestInterception(true);
@@ -442,7 +445,11 @@ describe("pickElectronTarget", () => {
 					{ cwd: process.cwd() },
 				);
 				attempted = true;
-				await expect(
+				// Plain await, not `.rejects`: on Windows, once an earlier test has
+				// spawned a piped child, Bun's `.rejects` loop spin stops servicing
+				// this thread's CDP socket, so the paused request never reaches
+				// `onRequest` and worker init times out instead.
+				const error = await rejectionOf(
 					acquireTab(`attach-failure-${process.pid}-${Math.random().toString(36).slice(2)}`, attached, {
 						// Loopback keeps a hypothetical interception miss local and
 						// loud (instant connection refusal, count 0) instead of
@@ -451,7 +458,9 @@ describe("pickElectronTarget", () => {
 						waitUntil: "domcontentloaded",
 						timeoutMs: 15_000,
 					}),
-				).rejects.toThrow(/net::ERR_FAILED/);
+				);
+				expect(error).toBeInstanceOf(Error);
+				expect(error).toMatchObject({ message: expect.stringMatching(/net::ERR_FAILED/) });
 				expect(requestCount).toBe(1);
 			} finally {
 				targetPage.off("request", onRequest);
@@ -486,7 +495,7 @@ describe("resolveSpawnArgs", () => {
 		expect(owned).not.toContain("--password-store=basic");
 
 		const borrowed = resolveSpawnArgs("/usr/bin/google-chrome-stable", ["--user-data-dir=/home/me/.config/chrome"]);
-		expect(borrowed).toEqual(["--user-data-dir=/home/me/.config/chrome"]);
+		expect(borrowed).toEqual([`--user-data-dir=${path.resolve("/home/me/.config/chrome")}`]);
 	});
 });
 
