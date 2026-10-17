@@ -126,6 +126,26 @@ describe("terminal image rendering", () => {
 		expect(placeholder).not.toBe(direct);
 	});
 
+	it("replays released image rows without replacing graphics or retransmitting image data", () => {
+		terminal.imageProtocol = ImageProtocol.Kitty;
+		const budget = new ImageBudget(1);
+		const image = new Image(
+			BASE64_ONE_PIXEL_PNG,
+			"image/png",
+			{ fallbackColor: text => text },
+			{ budget, imageKey: "released-image", maxWidthCells: 10, maxHeightCells: 2 },
+			SQUARE_DIMENSIONS,
+		);
+
+		const first = image.render(20);
+		expect(first.join("")).toContain("\x1b_Ga=p");
+		expect(budget.takeTransmits()).toHaveLength(1);
+
+		image.releaseRenderCaches();
+		expect(image.render(20)).toEqual(first);
+		expect(budget.takeTransmits()).toEqual([]);
+	});
+
 	it("uses intrinsic image size when no bounds are provided", () => {
 		terminal.imageProtocol = ImageProtocol.Kitty;
 		const result = renderImage(BASE64_DUMMY, SQUARE_DIMENSIONS);
@@ -161,17 +181,43 @@ describe("terminal image rendering", () => {
 		expect(result?.sequence).toContain("height=auto");
 	});
 
-	it("encodes SIXEL output when protocol is SIXEL", () => {
+	it("encodes SIXEL at the cell box size and reserves rows while one is pending", () => {
+		terminal.imageProtocol = ImageProtocol.Sixel;
+		setCellDimensions({ widthPx: 10, heightPx: 20 });
+		const requested: Array<[number, number]> = [];
+		// A raster padded to 90x11 cells, as SvgFigure draws it: encoding it at
+		// any other size resamples every glyph. The encoder, not this size,
+		// drops the partial 6px band 220px ends in.
+		const pending = renderImage(
+			BASE64_ONE_PIXEL_PNG,
+			{ widthPx: 900, heightPx: 220 },
+			{
+				maxWidthCells: 90,
+				maxHeightCells: 11,
+				sixel: (widthPx, heightPx) => {
+					requested.push([widthPx, heightPx]);
+					return undefined;
+				},
+			},
+		);
+
+		expect(requested).toEqual([[900, 220]]);
+		expect(pending).toEqual({ sequence: undefined, rows: 11 });
+		const failed = renderImage(BASE64_ONE_PIXEL_PNG, SQUARE_DIMENSIONS, {
+			maxWidthCells: 10,
+			maxHeightCells: 2,
+			sixel: () => null,
+		});
+		expect(failed).toBeNull();
+	});
+
+	it("encodes SIXEL synchronously when the caller supplies no provider", () => {
 		terminal.imageProtocol = ImageProtocol.Sixel;
 		const result = renderImage(BASE64_ONE_PIXEL_PNG, SQUARE_DIMENSIONS, {
 			maxWidthCells: 10,
 			maxHeightCells: 2,
 		});
 
-		expect(result).not.toBeNull();
-		// SIXEL height is rounded DOWN to a multiple of 6 (band size) so it
-		// never exceeds the caller's maxHeightCells cap. With 10px cells and
-		// maxHeightCells=2, targetHeightPx=18 (not 20), rows=2 — within cap.
 		expect(result?.rows).toBe(2);
 		expect((result?.sequence ?? "").startsWith("\x1bP")).toBe(true);
 	});

@@ -102,6 +102,10 @@ describe("Hindsight incremental full-session retention cache", () => {
 			"[role: user]\nhello first turn\n[user:end]\n\n[role: assistant]\nhi there first response\n[assistant:end]\n\n" +
 				"[role: user]\nhello second turn\n[user:end]\n\n[role: assistant]\nhi there second response\n[assistant:end]",
 		);
+
+		// The extended prefix hash must recognize an unchanged snapshot without retaining it again.
+		await state.retainSession(messages2);
+		expect(client.calls).toHaveLength(1);
 	});
 
 	it("Branch shrink (rewind): self-heals when message list shrinks, rebuilding and retaining full shorter transcript", async () => {

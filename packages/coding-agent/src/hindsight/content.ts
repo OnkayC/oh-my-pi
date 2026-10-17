@@ -16,10 +16,12 @@ export interface HindsightMessage {
 	timestamp?: string;
 }
 
-/** Rolling hash of messages[0, count) for retention-cache and transcript-boundary validation. */
-export function retentionPrefixKey(messages: HindsightMessage[], count: number): string {
-	let key = "";
-	for (let i = 0; i < count; i++) {
+/**
+ * Rolling hash of messages[0, count) for retention-cache and transcript-boundary validation.
+ * To extend a known prefix, pass its message count as `from` and its hash as `key`.
+ */
+export function retentionPrefixKey(messages: HindsightMessage[], count: number, from = 0, key = ""): string {
+	for (let i = from; i < count; i++) {
 		const m = messages[i];
 		if (m === undefined) break;
 		key = Bun.hash(`${key}\u0000${m.role}\u0000${m.content}\u0000${m.timestamp ?? ""}`).toString(36);

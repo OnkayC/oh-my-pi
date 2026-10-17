@@ -54,7 +54,7 @@ jobs:
               RELEASE_TARGETS: ${{ matrix.target_id }}
            run: bun run ci:release:build-hindsight-agent-bridge
          - name: Sign and notarize macOS bridge
-           if: startsWith(matrix.target_id, 'darwin-') && env.MACOS_SIGNING == 'true'
+           if: startsWith(matrix.target_id, 'darwin-')
            env:
               APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
               APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -67,8 +67,13 @@ jobs:
            if: startsWith(matrix.target_id, 'darwin-')
            shell: bash
            run: |
-              codesign -dvvv "$BRIDGE_BINARY"
+              info="$(codesign -dvvv "$BRIDGE_BINARY" 2>&1)"
+              echo "$info"
               codesign --verify --strict --verbose=4 "$BRIDGE_BINARY"
+              if [[ "$MACOS_SIGNING" == true ]] && grep -qE "flags=.*adhoc|Signature=adhoc" <<< "$info"; then
+                echo "::error::$BRIDGE_BINARY is ad-hoc signed (Developer ID signing did not run)"
+                exit 1
+              fi
          - name: Smoke Hindsight agent bridge
            shell: bash
            run: bash scripts/ci-smoke-hindsight-agent-bridge.sh "$BRIDGE_BINARY" "${GITHUB_REF_NAME#hindsight-agent-bridge-v}"
